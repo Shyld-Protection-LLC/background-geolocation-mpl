@@ -1,0 +1,275 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+package com.capgo.capacitor_background_geolocation;
+
+import android.content.Context;
+import android.content.SharedPreferences;
+import com.getcapacitor.Logger;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+// Persists the configuration for a native location watcher and delivers
+// location updates to a configured URL directly from native code. This mirrors
+// GeofenceStore and exists so that background location delivery keeps working
+// after the WebView (and its JavaScript callback) has been destroyed.
+final class LocationStore {
+
+    private static final String PREFS_NAME = "CapgoBackgroundGeolocationWatcher";
+    private static final String KEY_ENABLED = "enabled";
+    private static final String KEY_URL = "url";
+    private static final String KEY_TITLE = "title";
+    private static final String KEY_MESSAGE = "message";
+    private static final String KEY_DISTANCE_FILTER = "distanceFilter";
+    private static final String KEY_HEADERS = "headers";
+    private static final String KEY_MIN_INTERVAL_MS = "minIntervalMs";
+    private static final String KEY_NETWORK_FALLBACK = "networkFallback";
+    private static final String KEY_LOCATION_LOG = "locationLog";
+    private static final String KEY_LOCATION_LOG_MAX_ENTRIES = "locationLogMaxEntries";
+    private static final String KEY_LOCATION_LOG_SQLITE = "locationLogSqlite";
+    private static final String KEY_LAST_POST_TIME = "lastPostTime";
+
+    private LocationStore() {}
+
+    private static SharedPreferences prefs(Context context) {
+        return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+    }
+
+    // Persists the watcher config. A null or empty url disables native delivery.
+    static void saveSetup(
+        Context context,
+        String url,
+        String title,
+        String message,
+        float distanceFilter,
+        Map<String, String> headers,
+        long minIntervalMs,
+        boolean networkFallback,
+        boolean locationLog,
+        int locationLogMaxEntries,
+        boolean locationLogSqlite
+    ) {
+        SharedPreferences.Editor editor = prefs(context).edit();
+        if (url == null || url.isEmpty()) {
+            // Shyld: keep the watcher's own settings, so Shyld's keep-alive (keepsRunning) can resume
+            // after a sticky restart; native delivery stays off without a URL (FORK.md).
+            editor
+                .remove(KEY_ENABLED)
+                .remove(KEY_URL)
+                .remove(KEY_HEADERS)
+                .remove(KEY_LAST_POST_TIME)
+                .putString(KEY_TITLE, title)
+                .putString(KEY_MESSAGE, message)
+                .putFloat(KEY_DISTANCE_FILTER, distanceFilter)
+                .putLong(KEY_MIN_INTERVAL_MS, Math.max(0L, minIntervalMs))
+                .putBoolean(KEY_NETWORK_FALLBACK, networkFallback);
+        } else {
+            editor
+                .putBoolean(KEY_ENABLED, true)
+                .putString(KEY_URL, url)
+                .putString(KEY_TITLE, title)
+                .putString(KEY_MESSAGE, message)
+                .putFloat(KEY_DISTANCE_FILTER, distanceFilter)
+                .putString(KEY_HEADERS, headersToJson(headers))
+                .putLong(KEY_MIN_INTERVAL_MS, Math.max(0L, minIntervalMs))
+                .putBoolean(KEY_NETWORK_FALLBACK, networkFallback)
+                .remove(KEY_LAST_POST_TIME);
+        }
+        editor
+            .putBoolean(KEY_LOCATION_LOG, locationLog)
+            .putInt(KEY_LOCATION_LOG_MAX_ENTRIES, locationLogMaxEntries)
+            .putBoolean(KEY_LOCATION_LOG_SQLITE, locationLogSqlite)
+            .apply();
+    }
+
+    static void saveHeaders(Context context, Map<String, String> headers) {
+        prefs(context).edit().putString(KEY_HEADERS, headersToJson(headers)).apply();
+    }
+
+    static void clear(Context context) {
+        prefs(context).edit().clear().apply();
+    }
+
+    static boolean isEnabled(Context context) {
+        SharedPreferences prefs = prefs(context);
+        return prefs.getBoolean(KEY_ENABLED, false) && prefs.getString(KEY_URL, null) != null;
+    }
+
+    /**
+     * Shyld: whether the service outlives the app: native delivery, or Shyld's outbox tracking a shift
+     * with its keep-tracking-after-swipe switch on (decision 0139; off until M8's validation).
+     */
+    static boolean keepsRunning(Context context) {
+        return isEnabled(context) || ShyldHandOff.keepTracking(context);
+    }
+
+    static String getUrl(Context context) {
+        return prefs(context).getString(KEY_URL, null);
+    }
+
+    static String getTitle(Context context) {
+        return prefs(context).getString(KEY_TITLE, "Using your location");
+    }
+
+    static String getMessage(Context context) {
+        return prefs(context).getString(KEY_MESSAGE, "");
+    }
+
+    static float getDistanceFilter(Context context) {
+        return prefs(context).getFloat(KEY_DISTANCE_FILTER, 0f);
+    }
+
+    static long getMinIntervalMs(Context context) {
+        return prefs(context).getLong(KEY_MIN_INTERVAL_MS, 0L);
+    }
+
+    static boolean getNetworkFallback(Context context) {
+        return prefs(context).getBoolean(KEY_NETWORK_FALLBACK, false);
+    }
+
+    static boolean getLocationLog(Context context) {
+        return prefs(context).getBoolean(KEY_LOCATION_LOG, false);
+    }
+
+    static int getLocationLogMaxEntries(Context context) {
+        return prefs(context).getInt(KEY_LOCATION_LOG_MAX_ENTRIES, LocationLog.DEFAULT_MAX_ENTRIES);
+    }
+
+    static boolean getLocationLogSqlite(Context context) {
+        return prefs(context).getBoolean(KEY_LOCATION_LOG_SQLITE, false);
+    }
+
+    static Map<String, String> getHeaders(Context context) {
+        return headersFromJson(prefs(context).getString(KEY_HEADERS, null));
+    }
+
+    // Returns true when this location should be POSTed given the configured
+    // minimum interval. Points older than the last sent time pass through.
+    static boolean shouldPost(Context context, long locationTimeMs) {
+        long minIntervalMs = getMinIntervalMs(context);
+        if (minIntervalMs <= 0) {
+            return true;
+        }
+        long lastPostTime = prefs(context).getLong(KEY_LAST_POST_TIME, Long.MIN_VALUE);
+        if (lastPostTime != Long.MIN_VALUE && locationTimeMs < lastPostTime) {
+            return true;
+        }
+        if (lastPostTime != Long.MIN_VALUE && locationTimeMs - lastPostTime < minIntervalMs) {
+            return false;
+        }
+        return true;
+    }
+
+    static void markPosted(Context context, long locationTimeMs) {
+        prefs(context).edit().putLong(KEY_LAST_POST_TIME, locationTimeMs).apply();
+    }
+
+    static long logLocationForNativePost(Context context, JSONObject data) {
+        if (!getLocationLog(context) || !getLocationLogSqlite(context)) {
+            return -1;
+        }
+        return LocationLog.getInstance(context).insert(data, getLocationLogMaxEntries(context));
+    }
+
+    // POSTs a single location as JSON to the configured url. Runs synchronously,
+    // so callers must invoke it off the main thread.
+    static void sendLocation(Context context, JSONObject data) throws IOException {
+        sendLocation(context, data, -1);
+    }
+
+    static void sendLocation(Context context, JSONObject data, long logId) throws IOException {
+        String urlString = getUrl(context);
+        if (urlString == null || urlString.isEmpty()) {
+            return;
+        }
+        long locationTimeMs = data.optLong("time", System.currentTimeMillis());
+        if (!shouldPost(context, locationTimeMs)) {
+            return;
+        }
+        HttpURLConnection connection = null;
+        try {
+            URL url = new URL(urlString);
+            byte[] body = data.toString().getBytes(StandardCharsets.UTF_8);
+            connection = (HttpURLConnection) url.openConnection();
+            connection.setRequestMethod("POST");
+            connection.setConnectTimeout(15000);
+            connection.setReadTimeout(15000);
+            connection.setDoOutput(true);
+            connection.setRequestProperty("Accept", "application/json");
+            connection.setRequestProperty("Content-Type", "application/json");
+            connection.setRequestProperty("Content-Length", String.valueOf(body.length));
+            for (Map.Entry<String, String> header : getHeaders(context).entrySet()) {
+                connection.setRequestProperty(header.getKey(), header.getValue());
+            }
+            try (OutputStream outputStream = connection.getOutputStream()) {
+                outputStream.write(body);
+            }
+            int responseCode = connection.getResponseCode();
+            Logger.debug("Location POST finished with response code: " + responseCode);
+            if (responseCode < HttpURLConnection.HTTP_OK || responseCode >= HttpURLConnection.HTTP_MULT_CHOICE) {
+                throw new IOException("Location POST failed with response code: " + responseCode);
+            }
+            markPosted(context, locationTimeMs);
+            if (logId != -1) {
+                LocationLog log = LocationLog.getInstance(context);
+                log.update(logId, LocationLog.STATUS_SENT, responseCode, null);
+            }
+        } catch (IOException exception) {
+            if (logId != -1) {
+                LocationLog log = LocationLog.getInstance(context);
+                log.update(logId, LocationLog.STATUS_FAILED, null, exception.getMessage());
+            }
+            throw exception;
+        } finally {
+            if (connection != null) {
+                connection.disconnect();
+            }
+        }
+    }
+
+    static String headersToJson(Map<String, String> headers) {
+        JSONObject object = new JSONObject();
+        if (headers != null) {
+            for (Map.Entry<String, String> entry : headers.entrySet()) {
+                if (entry.getKey() == null || entry.getValue() == null) {
+                    continue;
+                }
+                try {
+                    object.put(entry.getKey(), entry.getValue());
+                } catch (JSONException ignore) {}
+            }
+        }
+        return object.toString();
+    }
+
+    static Map<String, String> headersFromJson(String json) {
+        if (json == null || json.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        try {
+            JSONObject object = new JSONObject(json);
+            Map<String, String> headers = new HashMap<>();
+            Iterator<String> keys = object.keys();
+            while (keys.hasNext()) {
+                String key = keys.next();
+                Object value = object.opt(key);
+                if (value != null && value != JSONObject.NULL) {
+                    headers.put(key, String.valueOf(value));
+                }
+            }
+            return headers;
+        } catch (JSONException exception) {
+            Logger.error("Could not parse persisted location headers", exception);
+            return Collections.emptyMap();
+        }
+    }
+}

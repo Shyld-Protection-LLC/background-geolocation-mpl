@@ -1,0 +1,1175 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+package com.capgo.capacitor_background_geolocation;
+
+import android.Manifest;
+import android.app.ForegroundServiceStartNotAllowedException;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.Intent;
+import android.content.ServiceConnection;
+import android.content.pm.PackageManager;
+import android.location.Location;
+import android.location.LocationManager;
+import android.net.Uri;
+import android.os.Build;
+import android.os.IBinder;
+import android.provider.Settings;
+import androidx.core.content.ContextCompat;
+import androidx.core.location.LocationCompat;
+import androidx.core.location.LocationManagerCompat;
+import com.getcapacitor.JSArray;
+import com.getcapacitor.JSObject;
+import com.getcapacitor.Logger;
+import com.getcapacitor.PermissionState;
+import com.getcapacitor.Plugin;
+import com.getcapacitor.PluginCall;
+import com.getcapacitor.PluginMethod;
+import com.getcapacitor.annotation.CapacitorPlugin;
+import com.getcapacitor.annotation.Permission;
+import com.getcapacitor.annotation.PermissionCallback;
+import com.google.android.gms.location.Geofence;
+import com.google.android.gms.location.GeofencingClient;
+import com.google.android.gms.location.GeofencingRequest;
+import com.google.android.gms.location.LocationServices;
+import java.net.URL;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.Iterator;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+@CapacitorPlugin(
+    name = "BackgroundGeolocation",
+    permissions = {
+        @Permission(strings = { Manifest.permission.ACCESS_COARSE_LOCATION, Manifest.permission.ACCESS_FINE_LOCATION }, alias = "location"),
+        @Permission(strings = { Manifest.permission.ACCESS_BACKGROUND_LOCATION }, alias = "backgroundLocation"),
+        @Permission(strings = { Manifest.permission.POST_NOTIFICATIONS }, alias = "notification")
+    }
+)
+public class BackgroundGeolocation extends Plugin {
+
+    private final String pluginVersion = BuildConfig.PLUGIN_VERSION;
+
+    private CompletableFuture<BackgroundGeolocationService.LocalBinder> serviceConnectionFuture;
+    // Completes once `serviceBinder.start(...)` has actually run, so `stop()` can
+    // wait for it instead of racing it on the raw service binding.
+    private CompletableFuture<Void> serviceStartedFuture;
+    private ServiceConnection serviceConnection;
+    private CompletableFuture<Void> locationPermissionFuture;
+    private CompletableFuture<Void> geofencePermissionFuture;
+    // Completes when stopOrphanedNativeDelivery finishes so start() cannot race it.
+    private CompletableFuture<Void> orphanNativeDeliveryStopFuture;
+    private final Set<PluginCall> canceledPermissionStarts = Collections.synchronizedSet(
+        Collections.newSetFromMap(new IdentityHashMap<PluginCall, Boolean>())
+    );
+    private PluginCall watchCall;
+
+    private void fetchLastLocation(PluginCall call) {
+        try {
+            LocationServices.getFusedLocationProviderClient(getContext())
+                .getLastLocation()
+                .addOnSuccessListener(getActivity(), (location) -> {
+                    if (location != null) {
+                        call.resolve(formatLocation(location));
+                    }
+                });
+        } catch (SecurityException ignore) {}
+    }
+
+    @PluginMethod(returnType = PluginMethod.RETURN_CALLBACK)
+    public void start(final PluginCall call) {
+        if (getPermissionState("location") != PermissionState.GRANTED && !call.getBoolean("requestPermissions", true)) {
+            call.reject("User denied location permission", "NOT_AUTHORIZED");
+            return;
+        }
+
+        if (serviceConnectionFuture != null) {
+            call.reject("Service already started", "ALREADY_STARTED");
+            return;
+        }
+
+        if (orphanNativeDeliveryStopFuture != null && !orphanNativeDeliveryStopFuture.isDone()) {
+            call.reject("Service already started", "ALREADY_STARTED");
+            return;
+        }
+
+        if (getPermissionState("location") != PermissionState.GRANTED && call.getBoolean("requestPermissions", true)) {
+            if (locationPermissionFuture != null && !locationPermissionFuture.isDone() && watchCall != null) {
+                call.reject("Service already started", "ALREADY_STARTED");
+                return;
+            }
+            call.setKeepAlive(true);
+            watchCall = call;
+            requestLocationPermissions(call)
+                .thenRun(() -> {
+                    if (canceledPermissionStarts.remove(call)) {
+                        if (watchCall == call) {
+                            watchCall = null;
+                            call.setKeepAlive(false);
+                        }
+                        return;
+                    }
+                    proceedWithStart(call);
+                })
+                .exceptionally((throwable) -> {
+                    canceledPermissionStarts.remove(call);
+                    call.reject("User denied location permission", "NOT_AUTHORIZED");
+                    return null;
+                });
+            return;
+        }
+
+        // location permission granted.
+        if (!isLocationEnabled(getContext())) {
+            call.reject("Location services disabled.", "NOT_AUTHORIZED");
+            return;
+        }
+
+        // Everything is OK, continuing to adding a watcher
+        call.setKeepAlive(true);
+        watchCall = call;
+        proceedWithStart(call);
+    }
+
+    private void proceedWithStart(PluginCall call) {
+        if (call.getBoolean("locationLogSqlite", false) && !BuildConfig.LOCATION_LOG_SQLITE) {
+            call.reject(LocationLog.SQLITE_DISABLED_MESSAGE);
+            return;
+        }
+        if (call.getBoolean("stale", false)) {
+            fetchLastLocation(call);
+        }
+        String backgroundTitle = call.getString("backgroundTitle", "Using your location");
+        String backgroundMessage = call.getString("backgroundMessage", "");
+        // The service promotes itself from these extras in onStartCommand(), without
+        // waiting for the bind.
+        Intent startIntent = createServiceIntent()
+            .putExtra(BackgroundGeolocationService.EXTRA_NOTIFICATION_TITLE, backgroundTitle)
+            .putExtra(BackgroundGeolocationService.EXTRA_NOTIFICATION_MESSAGE, backgroundMessage);
+        CompletableFuture<BackgroundGeolocationService.LocalBinder> connectionFuture = getServiceConnection(startIntent);
+        serviceStartedFuture = connectionFuture.thenAccept((serviceBinder) -> {
+            serviceBinder.start(
+                call.getCallbackId(),
+                backgroundTitle,
+                backgroundMessage,
+                call.getFloat("distanceFilter", 0f),
+                call.getString("url", null),
+                headersFromCall(call),
+                longOptionFromCall(call, "minIntervalMs", 0L),
+                call.getBoolean("networkFallback", false),
+                call.getBoolean("locationLog", false),
+                Math.max(1, call.getInt("locationLogMaxEntries", LocationLog.DEFAULT_MAX_ENTRIES)),
+                call.getBoolean("locationLogSqlite", false)
+            );
+        });
+        serviceStartedFuture.exceptionally((throwable) -> {
+            if (serviceConnectionFuture == connectionFuture) {
+                releaseServiceConnection();
+                stopBackgroundService();
+                serviceConnectionFuture = null;
+            }
+            rejectServiceStartFailure(call, throwable);
+            return null;
+        });
+    }
+
+    /** Drops geofence transitions queued for a native POST, for sign-out or an account switch. */
+    @PluginMethod
+    public void clearGeofenceQueue(PluginCall call) {
+        GeofenceStore.cancelQueuedTransitions(getContext());
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void updateHeaders(PluginCall call) {
+        Map<String, String> headers = headersFromObject(call.getObject("headers", new JSObject()));
+        LocationStore.saveHeaders(getContext(), headers);
+        GeofenceStore.saveHeaders(getContext(), headers);
+        if (serviceConnectionFuture != null) {
+            getServiceConnection()
+                .thenAccept((serviceBinder) -> {
+                    serviceBinder.updateHeaders(headers);
+                    call.resolve();
+                })
+                .exceptionally((throwable) -> {
+                    call.reject("Failed to update headers: " + throwable.getMessage());
+                    return null;
+                });
+            return;
+        }
+        call.resolve();
+    }
+
+    private CompletableFuture<Void> requestLocationPermissions(PluginCall call) {
+        if (locationPermissionFuture != null) {
+            return locationPermissionFuture;
+        }
+        // The permission callback can run synchronously when Android cancels the request; it may
+        // complete and clear locationPermissionFuture before this method returns.
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        locationPermissionFuture = future;
+        requestPermissionForAlias("location", call, "locationPermissionsCallback");
+        return future;
+    }
+
+    @PermissionCallback
+    private void locationPermissionsCallback(PluginCall call) {
+        if (locationPermissionFuture == null) {
+            return;
+        }
+
+        requestPermissionForAlias("notification", call, "notificationPermissionsCallback");
+
+        if (getPermissionState("location") != PermissionState.GRANTED) {
+            locationPermissionFuture.completeExceptionally(new SecurityException("User denied location permission"));
+            locationPermissionFuture = null;
+            return;
+        }
+
+        locationPermissionFuture.complete(null);
+        locationPermissionFuture = null;
+    }
+
+    @PermissionCallback
+    private void notificationPermissionsCallback(PluginCall call) {
+        Logger.debug("notification permission callback");
+    }
+
+    @PluginMethod
+    @Override
+    public void checkPermissions(PluginCall call) {
+        call.resolve(buildPermissionStatus());
+    }
+
+    @PluginMethod
+    @Override
+    public void requestPermissions(PluginCall call) {
+        Set<String> permissions = parseRequestedPermissions(call);
+        if (!permissions.contains("location") && !permissions.contains("backgroundLocation") && !permissions.contains("notification")) {
+            call.resolve(buildPermissionStatus());
+            return;
+        }
+        continuePermissionRequest(call, permissions);
+    }
+
+    @PermissionCallback
+    private void generalLocationPermissionsCallback(PluginCall call) {
+        Set<String> permissions = parseRequestedPermissions(call);
+        permissions.remove("location");
+        continuePermissionRequest(call, permissions);
+    }
+
+    @PermissionCallback
+    private void generalBackgroundPermissionsCallback(PluginCall call) {
+        Set<String> permissions = parseRequestedPermissions(call);
+        permissions.remove("backgroundLocation");
+        continuePermissionRequest(call, permissions);
+    }
+
+    @PermissionCallback
+    private void generalNotificationPermissionsCallback(PluginCall call) {
+        call.resolve(buildPermissionStatus());
+    }
+
+    private void continuePermissionRequest(PluginCall call, Set<String> permissions) {
+        if (permissions.contains("location") && getPermissionState("location") != PermissionState.GRANTED) {
+            requestPermissionForAlias("location", call, "generalLocationPermissionsCallback");
+            return;
+        }
+        if (
+            permissions.contains("backgroundLocation") &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+            getPermissionState("location") == PermissionState.GRANTED &&
+            getPermissionState("backgroundLocation") != PermissionState.GRANTED
+        ) {
+            requestPermissionForAlias("backgroundLocation", call, "generalBackgroundPermissionsCallback");
+            return;
+        }
+        if (
+            permissions.contains("notification") &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            getPermissionState("notification") != PermissionState.GRANTED
+        ) {
+            requestPermissionForAlias("notification", call, "generalNotificationPermissionsCallback");
+            return;
+        }
+        call.resolve(buildPermissionStatus());
+    }
+
+    private Set<String> parseRequestedPermissions(PluginCall call) {
+        JSArray permissionsArray = call.getArray("permissions");
+        Set<String> permissions = new HashSet<>();
+        if (permissionsArray == null) {
+            permissions.add("location");
+            permissions.add("backgroundLocation");
+            permissions.add("notification");
+            return permissions;
+        }
+        try {
+            for (int i = 0; i < permissionsArray.length(); i++) {
+                String permission = permissionsArray.getString(i);
+                if (permission != null && !permission.isEmpty()) {
+                    permissions.add(permission);
+                }
+            }
+        } catch (JSONException exception) {
+            Logger.error("Could not parse permissions array", exception);
+        }
+        if (permissions.isEmpty()) {
+            permissions.add("location");
+            permissions.add("backgroundLocation");
+            permissions.add("notification");
+        }
+        return permissions;
+    }
+
+    private JSObject buildPermissionStatus() {
+        JSObject ret = new JSObject();
+        ret.put("location", permissionStateValue(getPermissionState("location")));
+        ret.put("backgroundLocation", getBackgroundLocationPermissionState());
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ret.put("notification", permissionStateValue(getPermissionState("notification")));
+        } else {
+            ret.put("notification", "granted");
+        }
+        return ret;
+    }
+
+    private String getBackgroundLocationPermissionState() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return permissionStateValue(getPermissionState("location"));
+        }
+        return permissionStateValue(getPermissionState("backgroundLocation"));
+    }
+
+    private String permissionStateValue(PermissionState state) {
+        switch (state) {
+            case GRANTED:
+                return "granted";
+            case DENIED:
+                return "denied";
+            case PROMPT:
+            case PROMPT_WITH_RATIONALE:
+            default:
+                return "prompt";
+        }
+    }
+
+    @PluginMethod
+    public void stop(PluginCall call) {
+        if (serviceConnectionFuture == null) {
+            if (locationPermissionFuture != null && !locationPermissionFuture.isDone()) {
+                PluginCall savedCall = watchCall;
+                if (savedCall != null) {
+                    canceledPermissionStarts.add(savedCall);
+                }
+                watchCall = null;
+                if (savedCall != null) {
+                    savedCall.setKeepAlive(false);
+                }
+            }
+            stopOrphanedNativeDelivery(call);
+            return;
+        }
+        // Wait for an in-flight start() to reach the service before stopping it.
+        // Without this, a start() immediately followed by stop() can deliver the
+        // stop to the service before the start (CompletableFuture runs dependents
+        // in LIFO order), leaving tracking running after stop() resolved.
+        CompletableFuture<BackgroundGeolocationService.LocalBinder> connectionAtStop = serviceConnectionFuture;
+        PluginCall watchCallAtStop = watchCall;
+        CompletableFuture<Void> started = serviceStartedFuture;
+        CompletableFuture<BackgroundGeolocationService.LocalBinder> ready =
+            started == null
+                ? connectionAtStop
+                : started
+                      .handle((ignored, startError) -> null)
+                      .thenCompose((ignored) -> {
+                          if (
+                              connectionAtStop == null ||
+                              serviceConnectionFuture != connectionAtStop ||
+                              connectionAtStop.isCompletedExceptionally()
+                          ) {
+                              // Start failed and was already cleaned up; nothing to stop.
+                              return CompletableFuture.completedFuture(null);
+                          }
+                          return connectionAtStop;
+                      });
+        ready
+            .thenAccept((service) -> {
+                if (service != null && serviceConnectionFuture == connectionAtStop && serviceStartedFuture == started) {
+                    service.stop();
+                }
+                if (watchCall == watchCallAtStop) {
+                    watchCall = null;
+                    if (watchCallAtStop != null) {
+                        watchCallAtStop.setKeepAlive(false);
+                    }
+                }
+                call.resolve();
+                if (serviceConnectionFuture == connectionAtStop && serviceStartedFuture == started) {
+                    serviceConnectionFuture = null;
+                    serviceStartedFuture = null;
+                }
+            })
+            .exceptionally((throwable) -> {
+                // Never leave the plugin wedged: if `serviceConnectionFuture` stayed
+                // set here, every later start() would be rejected with
+                // ALREADY_STARTED until the app process died.
+                if (serviceConnectionFuture == connectionAtStop) {
+                    releaseServiceConnection();
+                    stopBackgroundService();
+                    serviceConnectionFuture = null;
+                    serviceStartedFuture = null;
+                }
+                call.reject("Service connection failed: " + throwable.getMessage());
+                return null;
+            });
+    }
+
+    @PluginMethod
+    public void openSettings(PluginCall call) {
+        Intent intent = new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+        Uri uri = Uri.fromParts("package", getContext().getPackageName(), null);
+        intent.setData(uri);
+        getContext().startActivity(intent);
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void setPlannedRoute(PluginCall call) {
+        String soundFile = call.getString("soundFile");
+        if (soundFile == null || soundFile.isEmpty()) {
+            call.reject("Sound file is required");
+            return;
+        }
+        if (serviceConnectionFuture == null) {
+            call.reject("Service not started, make sure to call start() first", "NOT_STARTED");
+            return;
+        }
+        try {
+            double[][] javaDoubleArray = getJavaDoubleArray(call.getArray("route"));
+            serviceConnectionFuture
+                .thenAccept((service) -> {
+                    service.setPlannedRoute(soundFile, javaDoubleArray, call.getFloat("distance", 50f));
+                    call.resolve();
+                })
+                .exceptionally((throwable) -> {
+                    call.reject("Failed to set route: " + throwable.getMessage());
+                    return null;
+                });
+        } catch (Exception ex) {
+            call.reject("Unable to parse route parameters");
+        }
+    }
+
+    @PluginMethod
+    public void setupGeofencing(PluginCall call) {
+        String url = call.getString("url");
+        if (url != null && !url.isEmpty()) {
+            try {
+                URL urlObject = new URL(url);
+                String protocol = urlObject.getProtocol();
+                if (!"http".equalsIgnoreCase(protocol) && !"https".equalsIgnoreCase(protocol)) {
+                    call.reject("Given url is not valid");
+                    return;
+                }
+            } catch (Exception exception) {
+                call.reject("Given url is not valid");
+                return;
+            }
+        }
+
+        JSObject payload = call.getObject("payload", new JSObject());
+        boolean backgroundLocation = call.getBoolean("backgroundLocation", false);
+        GeofenceStore.saveSetupForGeofencing(
+            getContext(),
+            url,
+            call.getBoolean("notifyOnEntry", true),
+            call.getBoolean("notifyOnExit", true),
+            payload,
+            backgroundLocation,
+            headersFromCall(call)
+        );
+
+        if (!call.getBoolean("requestPermissions", true)) {
+            call.resolve();
+            return;
+        }
+
+        requestGeofencePermissions(call, backgroundLocation)
+            .thenRun(call::resolve)
+            .exceptionally((throwable) -> {
+                call.reject(geofencePermissionMessage(backgroundLocation), "NOT_AUTHORIZED");
+                return null;
+            });
+    }
+
+    @PluginMethod
+    public void addGeofence(PluginCall call) {
+        boolean backgroundLocation = GeofenceStore.getBackgroundLocation(getContext());
+        if (!hasGeofencePermissions(backgroundLocation)) {
+            call.reject(geofencePermissionMessage(backgroundLocation), "NOT_AUTHORIZED");
+            return;
+        }
+        if (!isLocationEnabled(getContext())) {
+            call.reject("Location services disabled.", "NOT_AUTHORIZED");
+            return;
+        }
+
+        Double latitude = call.getDouble("latitude");
+        Double longitude = call.getDouble("longitude");
+        String identifier = call.getString("identifier");
+        double radius = call.getDouble("radius", 50.0);
+        if (identifier == null || identifier.isEmpty()) {
+            call.reject("Identifier is required");
+            return;
+        }
+        if (latitude == null || latitude < -90 || latitude > 90) {
+            call.reject("Latitude must be between -90 and 90");
+            return;
+        }
+        if (longitude == null || longitude < -180 || longitude > 180) {
+            call.reject("Longitude must be between -180 and 180");
+            return;
+        }
+        if (radius <= 0) {
+            call.reject("Radius must be greater than 0");
+            return;
+        }
+
+        boolean notifyOnEntry = call.getBoolean("notifyOnEntry", GeofenceStore.getNotifyOnEntry(getContext()));
+        boolean notifyOnExit = call.getBoolean("notifyOnExit", GeofenceStore.getNotifyOnExit(getContext()));
+        int transitionTypes = 0;
+        int initialTrigger = 0;
+        if (notifyOnEntry) {
+            transitionTypes |= Geofence.GEOFENCE_TRANSITION_ENTER;
+            initialTrigger |= GeofencingRequest.INITIAL_TRIGGER_ENTER;
+        }
+        if (notifyOnExit) {
+            transitionTypes |= Geofence.GEOFENCE_TRANSITION_EXIT;
+        }
+        if (transitionTypes == 0) {
+            call.reject("At least one transition must be enabled");
+            return;
+        }
+
+        JSObject payload = call.getObject("payload", new JSObject());
+        Geofence geofence = new Geofence.Builder()
+            .setRequestId(identifier)
+            .setCircularRegion(latitude, longitude, (float) radius)
+            .setTransitionTypes(transitionTypes)
+            .setExpirationDuration(Geofence.NEVER_EXPIRE)
+            .build();
+        GeofencingRequest request = new GeofencingRequest.Builder().setInitialTrigger(initialTrigger).addGeofence(geofence).build();
+
+        try {
+            getGeofencingClient()
+                .addGeofences(request, getGeofencePendingIntent())
+                .addOnSuccessListener((unused) -> {
+                    try {
+                        GeofenceStore.saveRegion(
+                            getContext(),
+                            identifier,
+                            latitude,
+                            longitude,
+                            (float) radius,
+                            notifyOnEntry,
+                            notifyOnExit,
+                            payload
+                        );
+                        call.resolve();
+                    } catch (JSONException exception) {
+                        call.reject("Could not persist geofence", exception);
+                    }
+                })
+                .addOnFailureListener((exception) -> call.reject("Could not start monitoring the geofence", exception));
+        } catch (SecurityException exception) {
+            call.reject(geofencePermissionMessage(backgroundLocation), "NOT_AUTHORIZED", exception);
+        }
+    }
+
+    @PluginMethod
+    public void removeGeofence(PluginCall call) {
+        String identifier = call.getString("identifier");
+        if (identifier == null || identifier.isEmpty()) {
+            call.reject("Identifier is required");
+            return;
+        }
+        getGeofencingClient()
+            .removeGeofences(Collections.singletonList(identifier))
+            .addOnSuccessListener((unused) -> {
+                GeofenceStore.removeRegion(getContext(), identifier);
+                call.resolve();
+            })
+            .addOnFailureListener((exception) -> call.reject("Could not stop monitoring the geofence", exception));
+    }
+
+    @PluginMethod
+    public void removeAllGeofences(PluginCall call) {
+        getGeofencingClient()
+            .removeGeofences(getGeofencePendingIntent())
+            .addOnSuccessListener((unused) -> {
+                GeofenceStore.clearRegions(getContext());
+                call.resolve();
+            })
+            .addOnFailureListener((exception) -> call.reject("Could not stop monitoring geofences", exception));
+    }
+
+    @PluginMethod
+    public void getMonitoredGeofences(PluginCall call) {
+        JSObject result = new JSObject();
+        Set<String> regionIds = GeofenceStore.getRegionIds(getContext());
+        JSArray regions = new JSArray();
+        for (String regionId : regionIds) {
+            regions.put(regionId);
+        }
+        result.put("regions", regions);
+        call.resolve(result);
+    }
+
+    @PluginMethod
+    public void getLocationLog(PluginCall call) {
+        if (!isWholeNumberOrAbsent(call, "afterId")) {
+            call.reject("afterId must be a number");
+            return;
+        }
+        Context context = getContext();
+        long afterId = longOptionFromCall(call, "afterId", 0L);
+        int limit = Math.min(LocationLog.MAX_LIMIT, Math.max(1, call.getInt("limit", LocationLog.DEFAULT_LIMIT)));
+        LocationLog.EXECUTOR.execute(() -> {
+            try {
+                JSObject result = new JSObject();
+                result.put("entries", LocationLog.getInstance(context).read(afterId, limit));
+                call.resolve(result);
+            } catch (Exception exception) {
+                call.reject("Could not read the location log", exception);
+            }
+        });
+    }
+
+    @PluginMethod
+    public void clearLocationLog(PluginCall call) {
+        if (!isWholeNumberOrAbsent(call, "upToId")) {
+            call.reject("upToId must be a number");
+            return;
+        }
+        Context context = getContext();
+        Long upToId = nullableWholeLongFromCall(call, "upToId");
+        LocationLog.EXECUTOR.execute(() -> {
+            try {
+                LocationLog.getInstance(context).clear(upToId);
+                call.resolve();
+            } catch (Exception exception) {
+                call.reject("Could not clear the location log", exception);
+            }
+        });
+    }
+
+    private CompletableFuture<Void> requestGeofencePermissions(PluginCall call, boolean backgroundLocation) {
+        if (hasGeofencePermissions(backgroundLocation)) {
+            return CompletableFuture.completedFuture(null);
+        }
+        if (geofencePermissionFuture != null) {
+            return geofencePermissionFuture;
+        }
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        geofencePermissionFuture = future;
+        if (getPermissionState("location") != PermissionState.GRANTED) {
+            requestPermissionForAlias("location", call, "geofenceLocationPermissionsCallback");
+            return future;
+        }
+        requestBackgroundLocationPermissionIfNeeded(call, backgroundLocation);
+        return future;
+    }
+
+    @PermissionCallback
+    private void geofenceLocationPermissionsCallback(PluginCall call) {
+        if (geofencePermissionFuture == null) {
+            return;
+        }
+        if (getPermissionState("location") != PermissionState.GRANTED) {
+            geofencePermissionFuture.completeExceptionally(new SecurityException("User denied location permission"));
+            geofencePermissionFuture = null;
+            return;
+        }
+        requestBackgroundLocationPermissionIfNeeded(call, GeofenceStore.getBackgroundLocation(getContext()));
+    }
+
+    @PermissionCallback
+    private void geofenceBackgroundPermissionsCallback(PluginCall call) {
+        if (geofencePermissionFuture == null) {
+            return;
+        }
+        if (!hasBackgroundLocationPermission()) {
+            geofencePermissionFuture.completeExceptionally(new SecurityException("User denied background location permission"));
+            geofencePermissionFuture = null;
+            return;
+        }
+        geofencePermissionFuture.complete(null);
+        geofencePermissionFuture = null;
+    }
+
+    private void requestBackgroundLocationPermissionIfNeeded(PluginCall call, boolean backgroundLocation) {
+        if (!backgroundLocation || hasBackgroundLocationPermission()) {
+            geofencePermissionFuture.complete(null);
+            geofencePermissionFuture = null;
+            return;
+        }
+        requestPermissionForAlias("backgroundLocation", call, "geofenceBackgroundPermissionsCallback");
+    }
+
+    private boolean hasGeofencePermissions(boolean backgroundLocation) {
+        return getPermissionState("location") == PermissionState.GRANTED && (!backgroundLocation || hasBackgroundLocationPermission());
+    }
+
+    private boolean hasBackgroundLocationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return true;
+        }
+        return (
+            ContextCompat.checkSelfPermission(getContext(), Manifest.permission.ACCESS_BACKGROUND_LOCATION) ==
+            PackageManager.PERMISSION_GRANTED
+        );
+    }
+
+    private String geofencePermissionMessage(boolean backgroundLocation) {
+        if (backgroundLocation) {
+            return "Background location permission is required for geofencing";
+        }
+        return "Location permission is required for geofencing";
+    }
+
+    private GeofencingClient getGeofencingClient() {
+        return LocationServices.getGeofencingClient(getContext());
+    }
+
+    private android.app.PendingIntent getGeofencePendingIntent() {
+        return GeofenceBroadcastReceiver.createPendingIntent(getContext());
+    }
+
+    private static double[][] getJavaDoubleArray(JSArray jsArray) throws JSONException {
+        int rows = jsArray.length();
+        if (rows == 0) {
+            return new double[0][2];
+        }
+
+        JSONArray firstRow = jsArray.getJSONArray(0);
+        int cols = firstRow.length();
+
+        var javaDoubleArray = new double[rows][cols];
+
+        for (int i = 0; i < rows; i++) {
+            JSONArray rowArray = jsArray.getJSONArray(i);
+            if (rowArray.length() != cols) {
+                throw new JSONException("Input array is not a consistent 2D array.");
+            }
+            for (int j = 0; j < cols; j++) {
+                javaDoubleArray[i][j] = rowArray.getDouble(j);
+            }
+        }
+        return javaDoubleArray;
+    }
+
+    // Checks if device-wide location services are disabled
+    private static Boolean isLocationEnabled(Context context) {
+        LocationManager lm = (LocationManager) context.getSystemService(Context.LOCATION_SERVICE);
+        return lm != null && LocationManagerCompat.isLocationEnabled(lm);
+    }
+
+    // Capacitor's PluginCall.getLong() only reads Java Long values. JS numbers that
+    // fit in 32 bits cross the bridge as Integer, so optLong is required (issue #62).
+    static long longOptionFromCall(PluginCall call, String key, long defaultValue) {
+        return call.getData().optLong(key, defaultValue);
+    }
+
+    static boolean isNumberOrAbsent(PluginCall call, String key) {
+        return !call.getData().has(key) || call.getData().opt(key) instanceof Number;
+    }
+
+    static boolean isWholeNumberOrAbsent(PluginCall call, String key) {
+        if (!call.getData().has(key)) {
+            return true;
+        }
+        Object value = call.getData().opt(key);
+        if (!(value instanceof Number)) {
+            return false;
+        }
+        double number = ((Number) value).doubleValue();
+        if (!Double.isFinite(number)) {
+            return false;
+        }
+        double rounded = Math.rint(number);
+        if (number != rounded) {
+            return false;
+        }
+        long asLong = (long) rounded;
+        return (double) asLong == rounded;
+    }
+
+    static Long nullableWholeLongFromCall(PluginCall call, String key) {
+        if (!call.getData().has(key)) {
+            return null;
+        }
+        return (long) Math.rint(((Number) call.getData().opt(key)).doubleValue());
+    }
+
+    private static Map<String, String> headersFromCall(PluginCall call) {
+        return headersFromObject(call.getObject("headers"));
+    }
+
+    private static Map<String, String> headersFromObject(JSObject headers) {
+        Map<String, String> result = new HashMap<>();
+        if (headers == null) {
+            return result;
+        }
+        Iterator<String> keys = headers.keys();
+        while (keys.hasNext()) {
+            String key = keys.next();
+            Object value = headers.opt(key);
+            if (value == null || value == JSONObject.NULL) {
+                continue;
+            }
+            result.put(key, String.valueOf(value));
+        }
+        return result;
+    }
+
+    private static JSObject formatLocation(Location location) {
+        JSObject obj = new JSObject();
+        obj.put("latitude", location.getLatitude());
+        obj.put("longitude", location.getLongitude());
+        // The docs state that all Location objects have an accuracy, but then why is there a
+        // hasAccuracy method? Better safe than sorry.
+        obj.put("accuracy", location.hasAccuracy() ? location.getAccuracy() : JSONObject.NULL);
+        obj.put("altitude", location.hasAltitude() ? location.getAltitude() : JSONObject.NULL);
+        if (Build.VERSION.SDK_INT >= 26 && location.hasVerticalAccuracy()) {
+            obj.put("altitudeAccuracy", location.getVerticalAccuracyMeters());
+        } else {
+            obj.put("altitudeAccuracy", JSONObject.NULL);
+        }
+        // In addition to mocking locations in development, Android allows the
+        // installation of apps which have the power to simulate location
+        // readings in other apps.
+        obj.put("simulated", LocationCompat.isMock(location));
+        obj.put("speed", location.hasSpeed() ? location.getSpeed() : JSONObject.NULL);
+        obj.put("bearing", location.hasBearing() ? location.getBearing() : JSONObject.NULL);
+        obj.put("time", location.getTime());
+        return obj;
+    }
+
+    // Receives messages from the service and the geofence broadcast receiver.
+    private final LocalEvents.Listener localEventListener = new LocalEvents.Listener() {
+        @Override
+        public void onLocation(String callbackId, Location location) {
+            PluginCall call = watchCall;
+            if (call == null) {
+                return;
+            }
+            call.resolve(formatLocation(location));
+        }
+
+        @Override
+        public void onGeofenceTransition(String payload) {
+            notifyGeofenceListeners("geofenceTransition", payload);
+        }
+
+        @Override
+        public void onGeofenceError(String payload) {
+            notifyGeofenceListeners("geofenceError", payload);
+        }
+    };
+
+    private void notifyGeofenceListeners(String eventName, String payload) {
+        if (payload == null || payload.isEmpty()) {
+            return;
+        }
+        try {
+            notifyListeners(eventName, GeofenceStore.toJSObject(new JSONObject(payload)), true);
+        } catch (JSONException exception) {
+            Logger.error("Could not parse geofence payload", exception);
+        }
+    }
+
+    @Override
+    public void load() {
+        super.load();
+
+        // Android O requires a Notification Channel.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationManager manager = (NotificationManager) getContext().getSystemService(Context.NOTIFICATION_SERVICE);
+            NotificationChannel channel = new NotificationChannel(
+                BackgroundGeolocationService.NOTIFICATION_CHANNEL_ID,
+                BackgroundGeolocationService.getAppString(
+                    "capacitor_background_geolocation_notification_channel_name",
+                    "Background Tracking",
+                    getContext()
+                ),
+                NotificationManager.IMPORTANCE_DEFAULT
+            );
+            channel.enableLights(false);
+            channel.enableVibration(false);
+            channel.setSound(null, null);
+            manager.createNotificationChannel(channel);
+        }
+
+        LocalEvents.addListener(localEventListener);
+    }
+
+    private CompletableFuture<BackgroundGeolocationService.LocalBinder> getServiceConnection() {
+        return getServiceConnection(createServiceIntent());
+    }
+
+    private CompletableFuture<BackgroundGeolocationService.LocalBinder> getServiceConnection(Intent serviceIntent) {
+        if (serviceConnectionFuture != null && !serviceConnectionFuture.isCompletedExceptionally()) {
+            return serviceConnectionFuture;
+        }
+
+        CompletableFuture<BackgroundGeolocationService.LocalBinder> connectionFuture = new CompletableFuture<>();
+        serviceConnectionFuture = connectionFuture;
+
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                this.getContext().startForegroundService(serviceIntent);
+            } else {
+                this.getContext().startService(serviceIntent);
+            }
+        } catch (RuntimeException exception) {
+            connectionFuture.completeExceptionally(exception);
+            serviceConnectionFuture = null;
+            return connectionFuture;
+        }
+
+        ServiceConnection connection = new ServiceConnection() {
+            @Override
+            public void onServiceConnected(ComponentName name, IBinder binder) {
+                connectionFuture.complete((BackgroundGeolocationService.LocalBinder) binder);
+            }
+
+            @Override
+            public void onServiceDisconnected(ComponentName name) {
+                if (serviceConnectionFuture == connectionFuture) {
+                    serviceConnection = null;
+                    serviceConnectionFuture = null;
+                }
+            }
+        };
+        serviceConnection = connection;
+
+        try {
+            boolean bound = this.getContext().bindService(serviceIntent, connection, Context.BIND_AUTO_CREATE);
+            if (!bound) {
+                serviceConnection = null;
+                IllegalStateException exception = new IllegalStateException("Failed to bind to background location service");
+                connectionFuture.completeExceptionally(exception);
+                stopBackgroundService();
+                serviceConnectionFuture = null;
+            }
+        } catch (SecurityException exception) {
+            serviceConnection = null;
+            connectionFuture.completeExceptionally(exception);
+            stopBackgroundService();
+            serviceConnectionFuture = null;
+        }
+
+        return connectionFuture;
+    }
+
+    private Intent createServiceIntent() {
+        return new Intent(this.getContext(), BackgroundGeolocationService.class);
+    }
+
+    private void stopBackgroundService() {
+        getContext().stopService(createServiceIntent());
+    }
+
+    // After activity recreation the plugin has no serviceConnectionFuture, but
+    // native delivery may still be running in the foreground service.
+    private void stopOrphanedNativeDelivery(PluginCall call) {
+        CompletableFuture<Void> pending = orphanNativeDeliveryStopFuture;
+        if (pending != null && !pending.isDone()) {
+            pending.whenComplete((ignored, throwable) -> {
+                if (throwable != null) {
+                    call.reject("Service connection failed: " + throwable.getMessage());
+                } else {
+                    call.resolve();
+                }
+            });
+            return;
+        }
+        if (!LocationStore.keepsRunning(getContext())) {
+            call.resolve();
+            return;
+        }
+        PluginCall watchCallAtOrphanStop = watchCall;
+        // Turn native delivery off first so a sticky restart cannot resume tracking.
+        LocationStore.clear(getContext());
+        Intent serviceIntent = createServiceIntent();
+        CompletableFuture<Void> bindComplete = new CompletableFuture<>();
+        CompletableFuture<Void> stopPending = new CompletableFuture<>();
+        orphanNativeDeliveryStopFuture = stopPending;
+        ServiceConnection orphanConnection = new ServiceConnection() {
+            @Override
+            public void onServiceConnected(ComponentName name, IBinder binder) {
+                try {
+                    ((BackgroundGeolocationService.LocalBinder) binder).stop();
+                    bindComplete.complete(null);
+                } catch (RuntimeException exception) {
+                    bindComplete.completeExceptionally(exception);
+                } finally {
+                    try {
+                        getContext().unbindService(this);
+                    } catch (IllegalArgumentException ignored) {
+                        // Service was not bound or already unbound.
+                    }
+                }
+            }
+
+            @Override
+            public void onServiceDisconnected(ComponentName name) {}
+        };
+
+        try {
+            boolean bound = getContext().bindService(serviceIntent, orphanConnection, Context.BIND_AUTO_CREATE);
+            if (!bound) {
+                unbindOrphanedConnection(orphanConnection);
+                stopBackgroundService();
+                finishOrphanNativeDeliveryStop(stopPending, call, watchCallAtOrphanStop);
+                return;
+            }
+        } catch (SecurityException exception) {
+            unbindOrphanedConnection(orphanConnection);
+            stopBackgroundService();
+            orphanNativeDeliveryStopFuture = null;
+            stopPending.completeExceptionally(exception);
+            call.reject("Service connection failed: " + exception.getMessage());
+            return;
+        }
+
+        bindComplete.whenComplete((ignored, throwable) -> {
+            if (throwable != null) {
+                stopBackgroundService();
+                orphanNativeDeliveryStopFuture = null;
+                stopPending.completeExceptionally(throwable);
+                call.reject("Service connection failed: " + throwable.getMessage());
+                return;
+            }
+            finishOrphanNativeDeliveryStop(stopPending, call, watchCallAtOrphanStop);
+        });
+    }
+
+    private void unbindOrphanedConnection(ServiceConnection connection) {
+        try {
+            getContext().unbindService(connection);
+        } catch (IllegalArgumentException ignored) {
+            // Connection was not registered.
+        }
+    }
+
+    private void finishOrphanNativeDeliveryStop(CompletableFuture<Void> stopPending, PluginCall call, PluginCall watchCallAtOrphanStop) {
+        resolveStopCall(call, watchCallAtOrphanStop);
+        orphanNativeDeliveryStopFuture = null;
+        stopPending.complete(null);
+    }
+
+    private void resolveStopCall(PluginCall call, PluginCall watchCallAtOrphanStop) {
+        if (watchCall == watchCallAtOrphanStop) {
+            if (watchCall != null) {
+                watchCall.setKeepAlive(false);
+                watchCall = null;
+            }
+        }
+        call.resolve();
+    }
+
+    private void releaseServiceConnection() {
+        if (serviceConnection == null) {
+            return;
+        }
+        try {
+            getContext().unbindService(serviceConnection);
+        } catch (IllegalArgumentException ignored) {
+            // Service was not bound or already unbound.
+        }
+        serviceConnection = null;
+    }
+
+    private void rejectServiceStartFailure(PluginCall call, Throwable throwable) {
+        Throwable cause = unwrapThrowable(throwable);
+        if (isForegroundServiceStartNotAllowed(cause)) {
+            call.reject(
+                "Cannot start background location while the app is in the background. Bring the app to the foreground and call start() again.",
+                "FOREGROUND_SERVICE_START_NOT_ALLOWED",
+                toException(cause)
+            );
+            return;
+        }
+        call.reject("Failed to start background location service: " + cause.getMessage(), toException(cause));
+    }
+
+    private static Exception toException(Throwable throwable) {
+        if (throwable instanceof Exception) {
+            return (Exception) throwable;
+        }
+        return new Exception(throwable);
+    }
+
+    static boolean isForegroundServiceStartNotAllowed(Throwable throwable) {
+        while (throwable != null) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && throwable instanceof ForegroundServiceStartNotAllowedException) {
+                return true;
+            }
+            String className = throwable.getClass().getName();
+            if (className.endsWith("ForegroundServiceStartNotAllowedException") || className.endsWith("ServiceStartNotAllowedException")) {
+                return true;
+            }
+            throwable = throwable.getCause();
+        }
+        return false;
+    }
+
+    private static Throwable unwrapThrowable(Throwable throwable) {
+        if (throwable instanceof java.util.concurrent.CompletionException && throwable.getCause() != null) {
+            return throwable.getCause();
+        }
+        return throwable;
+    }
+
+    @Override
+    protected void handleOnDestroy() {
+        // In native delivery mode the foreground service must keep tracking after
+        // the app UI (and this plugin instance) is destroyed, so it is not stopped.
+        if (serviceConnectionFuture != null && !LocationStore.keepsRunning(getContext())) {
+            serviceConnectionFuture.thenAccept(BackgroundGeolocationService.LocalBinder::stop);
+        }
+
+        if (locationPermissionFuture != null && !locationPermissionFuture.isDone()) {
+            locationPermissionFuture.cancel(true);
+        }
+        if (geofencePermissionFuture != null && !geofencePermissionFuture.isDone()) {
+            geofencePermissionFuture.cancel(true);
+        }
+        LocalEvents.removeListener(localEventListener);
+        super.handleOnDestroy();
+    }
+
+    @PluginMethod
+    public void getPluginVersion(final PluginCall call) {
+        try {
+            final JSObject ret = new JSObject();
+            ret.put("version", this.pluginVersion);
+            call.resolve(ret);
+        } catch (final Exception e) {
+            call.reject("Could not get plugin version", e);
+        }
+    }
+}

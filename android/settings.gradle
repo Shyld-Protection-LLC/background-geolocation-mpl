@@ -1,0 +1,4 @@
+// Shyld: standalone builds only (the upstream tests and a compile check); the app's own
+// settings include this library through `cap sync`.
+include ':capacitor-android'
+project(':capacitor-android').projectDir = new File('../node_modules/@capacitor/android/capacitor')

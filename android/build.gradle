@@ -1,0 +1,89 @@
+ext {
+    junitVersion = project.hasProperty('junitVersion') ? rootProject.ext.junitVersion : '4.13.2'
+    androidxAppCompatVersion = project.hasProperty('androidxAppCompatVersion') ? rootProject.ext.androidxAppCompatVersion : '1.8.0'
+    androidxJunitVersion = project.hasProperty('androidxJunitVersion') ? rootProject.ext.androidxJunitVersion : '1.3.0'
+    androidxEspressoCoreVersion = project.hasProperty('androidxEspressoCoreVersion') ? rootProject.ext.androidxEspressoCoreVersion : '3.7.0'
+    androidxWorkRuntimeVersion = project.hasProperty('androidxWorkRuntimeVersion') ? rootProject.ext.androidxWorkRuntimeVersion : '2.11.2'
+    playServicesLocationVersion = project.hasProperty('playServicesLocationVersion') ? rootProject.ext.playServicesLocationVersion : '21.4.0'
+}
+
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.13.0'
+    }
+}
+
+apply plugin: 'com.android.library'
+
+// The plugin version is read from package.json at build time so the value
+// returned by getPluginVersion() can never drift from the published package.
+def pluginVersion = new groovy.json.JsonSlurper().parse(file('../package.json')).version
+def includeLocationLogSqlite = project.findProperty('backgroundGeolocation.locationLogSqlite.include') ?: 'false'
+
+android {
+    namespace = "com.capgo.capacitor_background_geolocation"
+    compileSdk = project.hasProperty('compileSdkVersion') ? rootProject.ext.compileSdkVersion : 36
+    defaultConfig {
+        minSdkVersion project.hasProperty('minSdkVersion') ? rootProject.ext.minSdkVersion : 24
+        targetSdkVersion project.hasProperty('targetSdkVersion') ? rootProject.ext.targetSdkVersion : 36
+        versionCode 1
+        versionName "1.0"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        buildConfigField "String", "PLUGIN_VERSION", "\"${pluginVersion}\""
+        buildConfigField "boolean", "LOCATION_LOG_SQLITE", includeLocationLogSqlite == 'true' ? 'true' : 'false'
+        consumerProguardFiles 'consumer-rules.pro'
+    }
+    buildFeatures {
+        buildConfig = true
+    }
+    sourceSets {
+        main {
+            if (includeLocationLogSqlite == 'true') {
+                java.srcDirs += 'src/sqliteEnabled/java'
+            }
+        }
+        test {
+            if (includeLocationLogSqlite == 'true') {
+                java.srcDirs += 'src/sqliteTest/java'
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    lint {
+        abortOnError = false
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_21
+        targetCompatibility JavaVersion.VERSION_21
+    }
+}
+
+repositories {
+    google()
+    mavenCentral()
+}
+
+
+dependencies {
+    implementation fileTree(dir: 'libs', include: ['*.jar'])
+    implementation project(':capacitor-android')
+    implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
+    implementation "androidx.work:work-runtime:$androidxWorkRuntimeVersion"
+    testImplementation "junit:junit:$junitVersion"
+    testImplementation "org.json:json:20260814"
+    testImplementation "org.robolectric:robolectric:4.17"
+    testImplementation "androidx.test:core:1.7.0"
+    testImplementation "androidx.work:work-testing:$androidxWorkRuntimeVersion"
+    androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
+    androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
+    implementation "com.google.android.gms:play-services-location:$playServicesLocationVersion"
+}

@@ -1,0 +1,267 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+package com.capgo.capacitor_background_geolocation;
+
+import static org.junit.Assert.*;
+
+import android.content.Intent;
+import android.location.Location;
+import androidx.core.location.LocationListenerCompat;
+import com.getcapacitor.JSObject;
+import com.getcapacitor.PermissionState;
+import com.getcapacitor.PluginCall;
+import com.google.android.gms.location.Geofence;
+import com.google.android.gms.location.GeofenceStatusCodes;
+import org.json.JSONException;
+import org.json.JSONObject;
+import org.junit.Test;
+
+/**
+ * Unit tests for BackgroundGeolocation plugin
+ */
+public class BackgroundGeolocationUnitTest {
+
+    @Test
+    public void testPluginVersionExists() {
+        // Test that plugin has version info
+        assertNotNull("Plugin should have version information", getClass().getPackage());
+    }
+
+    @Test
+    public void testLocationDataStructure() {
+        // Test basic location data structure
+        assertNotNull("Location class should be available", Location.class);
+    }
+
+    @Test
+    public void testPackageStructure() {
+        // Verify main classes exist
+        try {
+            Class<?> pluginClass = Class.forName("com.capgo.capacitor_background_geolocation.BackgroundGeolocation");
+            assertNotNull("BackgroundGeolocation plugin class should exist", pluginClass);
+
+            Class<?> serviceClass = Class.forName("com.capgo.capacitor_background_geolocation.BackgroundGeolocationService");
+            assertNotNull("BackgroundGeolocationService class should exist", serviceClass);
+
+            Class<?> receiverClass = Class.forName("com.capgo.capacitor_background_geolocation.GeofenceBroadcastReceiver");
+            assertNotNull("GeofenceBroadcastReceiver class should exist", receiverClass);
+
+            Class<?> storeClass = Class.forName("com.capgo.capacitor_background_geolocation.GeofenceStore");
+            assertNotNull("GeofenceStore class should exist", storeClass);
+
+            Class<?> bootReceiverClass = Class.forName("com.capgo.capacitor_background_geolocation.GeofenceBootReceiver");
+            assertNotNull("GeofenceBootReceiver class should exist", bootReceiverClass);
+        } catch (ClassNotFoundException e) {
+            fail("Plugin classes should exist: " + e.getMessage());
+        }
+    }
+
+    @Test
+    public void testCreateLocationListenerReturnsCompatListener() {
+        LocationListenerCompat listener = BackgroundGeolocationService.createLocationListener(null);
+        assertNotNull("Location listener should be created", listener);
+    }
+
+    @Test
+    public void testPermissionStateValueMapping() throws Exception {
+        java.lang.reflect.Method method = BackgroundGeolocation.class.getDeclaredMethod("permissionStateValue", PermissionState.class);
+        method.setAccessible(true);
+        BackgroundGeolocation plugin = new BackgroundGeolocation();
+
+        assertEquals("granted", method.invoke(plugin, PermissionState.GRANTED));
+        assertEquals("denied", method.invoke(plugin, PermissionState.DENIED));
+        assertEquals("prompt", method.invoke(plugin, PermissionState.PROMPT));
+        assertEquals("prompt", method.invoke(plugin, PermissionState.PROMPT_WITH_RATIONALE));
+    }
+
+    @Test
+    public void testGeofenceResetErrorClearsStoredRegions() {
+        assertTrue(
+            "GEOFENCE_NOT_AVAILABLE should clear stale cached geofences",
+            GeofenceBroadcastReceiver.shouldClearStoredRegions(GeofenceStatusCodes.GEOFENCE_NOT_AVAILABLE)
+        );
+        assertFalse(
+            "Other geofence errors should preserve cached regions",
+            GeofenceBroadcastReceiver.shouldClearStoredRegions(GeofenceStatusCodes.GEOFENCE_TOO_MANY_GEOFENCES)
+        );
+    }
+
+    @Test
+    public void testGeofenceBootReceiverRestoreActions() {
+        assertTrue(
+            "BOOT_COMPLETED should restore persisted geofences",
+            GeofenceBootReceiver.shouldRestoreAction(Intent.ACTION_BOOT_COMPLETED)
+        );
+        assertTrue(
+            "MY_PACKAGE_REPLACED should restore persisted geofences",
+            GeofenceBootReceiver.shouldRestoreAction(Intent.ACTION_MY_PACKAGE_REPLACED)
+        );
+        assertFalse("Other actions should be ignored", GeofenceBootReceiver.shouldRestoreAction(Intent.ACTION_AIRPLANE_MODE_CHANGED));
+    }
+
+    @Test
+    public void testGeofenceTransitionTypes() throws Exception {
+        assertEquals(
+            Geofence.GEOFENCE_TRANSITION_ENTER | Geofence.GEOFENCE_TRANSITION_EXIT,
+            GeofenceStore.geofenceTransitionTypes(true, true)
+        );
+        assertEquals(Geofence.GEOFENCE_TRANSITION_ENTER, GeofenceStore.geofenceTransitionTypes(true, false));
+        assertEquals(Geofence.GEOFENCE_TRANSITION_EXIT, GeofenceStore.geofenceTransitionTypes(false, true));
+    }
+
+    @Test
+    public void testLongOptionFromCallCoercesIntegerBridgeValue() throws JSONException {
+        JSObject data = new JSObject();
+        data.put("minIntervalMs", 295_000);
+
+        PluginCall call = new PluginCall(null, "BackgroundGeolocation", "test-callback", "start", data);
+
+        assertEquals(
+            "JS numbers within Integer range must be read as minIntervalMs",
+            295_000L,
+            BackgroundGeolocation.longOptionFromCall(call, "minIntervalMs", 0L)
+        );
+        assertEquals("PluginCall.getLong misses Integer bridge values (issue #62)", Long.valueOf(0L), call.getLong("minIntervalMs", 0L));
+    }
+
+    @Test
+    public void testLongOptionFromCallUsesDefaultWhenMissing() {
+        PluginCall call = new PluginCall(null, "BackgroundGeolocation", "test-callback", "start", new JSObject());
+
+        assertEquals(0L, BackgroundGeolocation.longOptionFromCall(call, "minIntervalMs", 0L));
+        assertEquals(60_000L, BackgroundGeolocation.longOptionFromCall(call, "minIntervalMs", 60_000L));
+    }
+
+    @Test
+    public void testForegroundServiceStartNotAllowedDetection() {
+        assertTrue(
+            "ForegroundServiceStartNotAllowedException class name should be detected",
+            BackgroundGeolocation.isForegroundServiceStartNotAllowed(new ForegroundServiceStartNotAllowedException())
+        );
+        assertTrue(
+            "ServiceStartNotAllowedException class name should be detected",
+            BackgroundGeolocation.isForegroundServiceStartNotAllowed(new ServiceStartNotAllowedException())
+        );
+        assertTrue(
+            "Wrapped foreground service start failures should be detected",
+            BackgroundGeolocation.isForegroundServiceStartNotAllowed(
+                new RuntimeException("wrapped", new ForegroundServiceStartNotAllowedException())
+            )
+        );
+        assertFalse(
+            "Unrelated exceptions should not be treated as FGS start failures",
+            BackgroundGeolocation.isForegroundServiceStartNotAllowed(new IllegalStateException("other failure"))
+        );
+    }
+
+    @Test
+    public void testBasicArithmetic() {
+        // Basic sanity test
+        assertEquals(4, 2 + 2);
+    }
+
+    @Test
+    public void testLocationAccuracyComparison() {
+        // Test location accuracy comparison logic
+        float highAccuracy = 10.0f;
+        float lowAccuracy = 100.0f;
+
+        assertTrue("Lower accuracy value means more accurate", highAccuracy < lowAccuracy);
+    }
+
+    @Test
+    public void testDistanceCalculation() {
+        // Test basic distance calculation concept
+        double lat1 = 0.0;
+        double lon1 = 0.0;
+        double lat2 = 0.0;
+        double lon2 = 0.0;
+
+        // Same location should have zero distance
+        assertEquals("Same coordinates should have zero distance", 0.0, calculateDistance(lat1, lon1, lat2, lon2), 0.001);
+    }
+
+    @Test
+    public void testCoordinateValidation() {
+        // Test coordinate validation
+        assertTrue("Valid latitude", isValidLatitude(45.0));
+        assertTrue("Valid longitude", isValidLongitude(90.0));
+
+        assertFalse("Invalid latitude (too high)", isValidLatitude(91.0));
+        assertFalse("Invalid latitude (too low)", isValidLatitude(-91.0));
+        assertFalse("Invalid longitude (too high)", isValidLongitude(181.0));
+        assertFalse("Invalid longitude (too low)", isValidLongitude(-181.0));
+    }
+
+    @Test
+    public void testTimestampValidation() {
+        // Test timestamp validation
+        long currentTime = System.currentTimeMillis();
+        long futureTime = currentTime + 10000;
+        long pastTime = currentTime - 10000;
+
+        assertTrue("Past timestamp should be valid", pastTime < currentTime);
+        assertTrue("Future timestamp should be after current", futureTime > currentTime);
+    }
+
+    @Test
+    public void testNullSafety() {
+        // Test null safety checks
+        String nullString = null;
+        assertNull("Null string should be null", nullString);
+
+        String emptyString = "";
+        assertNotNull("Empty string should not be null", emptyString);
+        assertTrue("Empty string should be empty", emptyString.isEmpty());
+    }
+
+    // Helper methods for testing
+
+    private double calculateDistance(double lat1, double lon1, double lat2, double lon2) {
+        // Simple distance calculation for testing
+        double deltaLat = lat2 - lat1;
+        double deltaLon = lon2 - lon1;
+        return Math.sqrt(deltaLat * deltaLat + deltaLon * deltaLon);
+    }
+
+    private boolean isValidLatitude(double latitude) {
+        return latitude >= -90.0 && latitude <= 90.0;
+    }
+
+    private boolean isValidLongitude(double longitude) {
+        return longitude >= -180.0 && longitude <= 180.0;
+    }
+
+    private static class ForegroundServiceStartNotAllowedException extends RuntimeException {}
+
+    private static class ServiceStartNotAllowedException extends RuntimeException {}
+
+    @Test
+    public void testIsNumberOrAbsent() {
+        JSObject data = new JSObject();
+        data.put("afterId", 4211);
+        data.put("upToId", JSONObject.NULL);
+        data.put("limit", "50");
+        PluginCall call = new PluginCall(null, "BackgroundGeolocation", "test-callback", "getLocationLog", data);
+
+        assertTrue(BackgroundGeolocation.isNumberOrAbsent(call, "afterId"));
+        assertTrue(BackgroundGeolocation.isNumberOrAbsent(call, "missing"));
+        assertFalse(BackgroundGeolocation.isNumberOrAbsent(call, "upToId"));
+        assertFalse(BackgroundGeolocation.isNumberOrAbsent(call, "limit"));
+    }
+
+    @Test
+    public void testIsWholeNumberOrAbsent() {
+        JSObject data = new JSObject();
+        data.put("afterId", 4211);
+        data.put("upToId", 4211.5);
+        data.put("fractional", 1.2);
+        PluginCall call = new PluginCall(null, "BackgroundGeolocation", "test-callback", "clearLocationLog", data);
+
+        assertTrue(BackgroundGeolocation.isWholeNumberOrAbsent(call, "afterId"));
+        assertTrue(BackgroundGeolocation.isWholeNumberOrAbsent(call, "missing"));
+        assertFalse(BackgroundGeolocation.isWholeNumberOrAbsent(call, "upToId"));
+        assertFalse(BackgroundGeolocation.isWholeNumberOrAbsent(call, "fractional"));
+    }
+}

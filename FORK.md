@@ -1,0 +1,19 @@
+# Shyld's fork of Capgo's background-geolocation
+
+Upstream: [Cap-go/capacitor-background-geolocation](https://github.com/Cap-go/capacitor-background-geolocation) at tag `8.6.5` (commit `26dcd51`), MPL-2.0 (`LICENSE`). Forked for the Shyld store app under decision 0139 (owner, 2026-11-19: N2-1 and N2-2).
+
+Every file here is covered by the MPL and carries its notice. They are published unchanged in the public mirror `Shyld-Protection-LLC/background-geolocation-mpl` (the owner's yes, 2026-11-19) at each store build (`pnpm --filter @shyld/plugin-background-geolocation mirror <dir>` gathers them). Nothing outside this folder is covered: Shyld's outbox (`../outbox`) receives the fixes over a process-local hand-off and is not part of this work.
+
+## What Shyld changed
+
+- **The hand-off.** `ShyldHandOff` on Android (`android/.../ShyldHandOff.java`) and iOS (`ios/Sources/.../ShyldHandOff.swift`), called once for each accepted fix, where upstream receives it (`BackgroundGeolocationService.handleLocationChanged`, `locationManager(_:didUpdateLocations:)`). Android finds `com.shyld.plugins.outbox.Outbox.onLocation` by name; iOS posts the `ShyldOutboxLocation` notification. On Android, `onTaskRemoved` also calls `com.shyld.plugins.alerts.Alerts.onAppClosed` by name, so a swipe-away on shift says "Tracking stopped". Without Shyld's plugins in the app, none of it does anything.
+- **Keep-alive (decision 0139).** `LocationStore.keepsRunning` replaces upstream's `isEnabled` where the service decides whether to outlive the app (`onUnbind`, `onTaskRemoved`, `onStartCommand`, the plugin's `handleOnDestroy` and orphan stop). It is native delivery, or Shyld's outbox tracking a shift with its `keepTrackingAfterSwipe` switch on (`ShyldHandOff.keepTracking`, by name). `saveSetup` keeps the watcher's title, message, distance filter, interval and fallback without a URL, so a sticky restart can resume; native delivery still needs a URL. "Tracking stopped" is said only when tracking really ends.
+- **No Always location (iOS).** Every `requestAlwaysAuthorization` call is gone: `handlePermissions` and the permission request ask When In Use only (no escalation), and geofence setup refuses at once, since geofencing needs Always. Shyld's design never asks for Always or background location, and Apple's scan (ITMS-90683) flags any build that calls it without the Always purpose string. Android declares no `ACCESS_BACKGROUND_LOCATION`, so its `backgroundLocation` alias can't be granted.
+- **The package.** `package.json` is Shyld's (`@shyld/plugin-background-geolocation`, version `8.6.5-shyld.N`, sources not built to `dist/`); `src/definitions.ts` is kept as `src/definitions.d.ts` (types only), and `src/index.ts` re-exports it with `export type *`. `android/settings.gradle` is a standalone build's. In `Package.swift` the package and its product are `ShyldPluginBackgroundGeolocation`, the npm name in PascalCase that Capacitor's sync expects (Shyld Dev's first iOS build stopped on it); the target and Swift module keep upstream's `CapgoBackgroundGeolocationPlugin`. The podspec, example app, docs and build scripts are left out (Swift Package Manager only).
+- **Notices and checks.** The MPL notice at the top of every source file, formatting by the repo's formatter and lint fixes, two index checks in `src/web.ts` for strict TypeScript, and the web version's route geometry moved unchanged to `src/route-geometry.ts` (the repo keeps TypeScript files under 400 lines).
+
+Upstream's own native uploader (`backendUrl`) and location log stay in the code, unused: Shyld doesn't configure them.
+
+## Updating from upstream
+
+Copy the new tag's files over these, re-apply the hand-off's two calls, keep the notices, run `pnpm --filter @shyld/plugin-background-geolocation test:android`, and bump the version's `-shyld.N`.
