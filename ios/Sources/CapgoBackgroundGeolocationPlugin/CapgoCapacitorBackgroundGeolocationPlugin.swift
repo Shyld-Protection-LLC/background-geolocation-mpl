@@ -67,7 +67,7 @@ public class BackgroundGeolocation: CAPPlugin, CLLocationManagerDelegate, CAPBri
     private var created: Date?
     private var allowStale: Bool = false
     private var isUpdatingLocation: Bool = false
-    private var activeCallbackId: String?
+    private(set) var activeCallbackId: String?
     private var audioPlayer: AVAudioPlayer?
     private var plannedRoute: [[Double]] = []
     private var isOffRoute: Bool = true
@@ -117,8 +117,10 @@ public class BackgroundGeolocation: CAPPlugin, CLLocationManagerDelegate, CAPBri
         // CLLocationManager requires main thread
         DispatchQueue.main.async {
             // Check if already started
-            if self.locationManager != nil {
-                return call.reject("Location tracking already started", "ALREADY_STARTED")
+            // Shyld (BL-088): a page reloaded while tracking runs (a live update, "Restart now")
+            // re-attaches its callback rather than being refused, so its screen gets fixes again.
+            if let manager = self.locationManager {
+                return self.reattach(call, manager: manager)
             }
             // Optional native delivery endpoint (same validation as setupGeofencing).
             if let urlString = call.getString("url"), !urlString.isEmpty {
@@ -172,6 +174,20 @@ public class BackgroundGeolocation: CAPPlugin, CLLocationManagerDelegate, CAPBri
                 }
             }
             return self.startUpdatingLocation()
+        }
+    }
+
+    /// Shyld (BL-088): hands the running session's fixes to a new start() call. The location
+    /// manager, its settings and the hand-off to the outbox are untouched; the old callback is
+    /// released, and the new one gets the last known fix at once.
+    func reattach(_ call: CAPPluginCall, manager: CLLocationManager) {
+        if let previous = activeCallbackId, previous != call.callbackId {
+            bridge?.savedCall(withID: previous)?.keepAlive = false
+            bridge?.releaseCall(withID: previous)
+        }
+        activeCallbackId = call.callbackId
+        if let location = manager.location, isLocationValid(location) {
+            call.resolve(formatLocation(location))
         }
     }
 

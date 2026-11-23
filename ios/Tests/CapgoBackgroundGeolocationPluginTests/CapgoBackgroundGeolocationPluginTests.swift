@@ -392,4 +392,30 @@ class CapgoBackgroundGeolocationTests: XCTestCase {
 
         wait(for: [rejected], timeout: 1)
     }
+
+    // MARK: - Re-attach (Shyld, BL-088)
+
+    /// A page reloaded while tracking runs gets the fixes: its callback replaces the earlier one,
+    /// and nothing is refused.
+    func testReattachHandsFixesToTheNewCallback() throws {
+        let plugin = try XCTUnwrap(self.plugin)
+        var errors = 0
+        let first = try XCTUnwrap(
+            CAPPluginCall(callbackId: "old-page", methodName: "start", options: [:],
+                          success: { _, _ in }, error: { _ in errors += 1 })
+        )
+        let second = try XCTUnwrap(
+            CAPPluginCall(callbackId: "new-page", methodName: "start", options: [:],
+                          success: { _, _ in }, error: { _ in errors += 1 })
+        )
+        let manager = CLLocationManager()
+
+        plugin.reattach(first, manager: manager)
+        XCTAssertEqual(plugin.activeCallbackId, "old-page")
+        plugin.reattach(second, manager: manager)
+        XCTAssertEqual(plugin.activeCallbackId, "new-page")
+        plugin.reattach(second, manager: manager)
+        XCTAssertEqual(plugin.activeCallbackId, "new-page")
+        XCTAssertEqual(errors, 0)
+    }
 }

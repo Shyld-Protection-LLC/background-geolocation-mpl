@@ -808,6 +808,10 @@ export interface BackgroundGeolocationPlugin {
    * A Promise is returned to indicate that it finished the call. The callback will be called every time a new location
    * is available, or if there was an error when calling this method. Don't rely on promise rejection for this.
    *
+   * Shyld (BL-088): called while tracking already runs (a page reloaded by a live update), it
+   * re-attaches: this callback replaces the earlier one and gets the last known fix at once; the
+   * running session and its options are kept, so the options passed here are ignored.
+   *
    * @param options The configuration options
    * @param callback The callback function invoked when a new location is available or an error occurs
    * @returns A promise that resolves when the method is successfully called

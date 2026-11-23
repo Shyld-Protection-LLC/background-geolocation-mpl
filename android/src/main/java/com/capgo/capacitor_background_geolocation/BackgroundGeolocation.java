@@ -94,7 +94,9 @@ public class BackgroundGeolocation extends Plugin {
         }
 
         if (serviceConnectionFuture != null) {
-            call.reject("Service already started", "ALREADY_STARTED");
+            // Shyld (BL-088): a page reloaded while tracking runs (a live update, "Restart now")
+            // re-attaches its callback rather than being refused, so its screen gets fixes again.
+            reattach(call);
             return;
         }
 
@@ -139,6 +141,23 @@ public class BackgroundGeolocation extends Plugin {
         call.setKeepAlive(true);
         watchCall = call;
         proceedWithStart(call);
+    }
+
+    /**
+     * Shyld (BL-088): hands the running session's fixes to a new start() call. The service, its
+     * settings and the native hand-off to the outbox are untouched; the old callback stops getting
+     * fixes, and the new one gets the last known fix at once when the screen is up.
+     */
+    void reattach(PluginCall call) {
+        PluginCall previous = watchCall;
+        call.setKeepAlive(true);
+        watchCall = call;
+        if (previous != null && previous != call) {
+            previous.setKeepAlive(false);
+        }
+        if (getActivity() != null) {
+            fetchLastLocation(call);
+        }
     }
 
     private void proceedWithStart(PluginCall call) {
