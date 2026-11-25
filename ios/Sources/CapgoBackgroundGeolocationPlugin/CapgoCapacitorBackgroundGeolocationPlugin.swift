@@ -47,6 +47,7 @@ public class BackgroundGeolocation: CAPPlugin, CLLocationManagerDelegate, CAPBri
     public let pluginMethods: [CAPPluginMethod] = [
         CAPPluginMethod(name: "start", returnType: CAPPluginReturnCallback),
         CAPPluginMethod(name: "stop", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "diagnostics", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "openSettings", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setPlannedRoute", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "setupGeofencing", returnType: CAPPluginReturnPromise),
@@ -68,6 +69,13 @@ public class BackgroundGeolocation: CAPPlugin, CLLocationManagerDelegate, CAPBri
     private var allowStale: Bool = false
     private var isUpdatingLocation: Bool = false
     private(set) var activeCallbackId: String?
+    // Shyld (BL-092): for diagnostics().
+    private(set) var lastFixAt: Date?
+    private(set) var lastError: String?
+    private(set) var lastErrorAt: Date?
+    // BL-092 backstop: when the outbox was first seen tracking no shift.
+    private var untrackedSince: Date?
+    private var trackerStopObserver: NSObjectProtocol?
     private var audioPlayer: AVAudioPlayer?
     private var plannedRoute: [[Double]] = []
     private var isOffRoute: Bool = true
@@ -108,6 +116,12 @@ public class BackgroundGeolocation: CAPPlugin, CLLocationManagerDelegate, CAPBri
         restoreGeofenceConfiguration()
         DispatchQueue.main.async {
             _ = self.ensureGeofenceLocationManager()
+        }
+        // Shyld (BL-092, C 11-24): a 409 stop_tracking in the outbox stops the tracker at once.
+        trackerStopObserver = NotificationCenter.default.addObserver(
+            forName: ShyldHandOff.stopName, object: nil, queue: .main
+        ) { [weak self] note in
+            self?.stopForOutbox(tracking: note.userInfo?["tracking"] as? Bool)
         }
     }
 
@@ -226,6 +240,47 @@ public class BackgroundGeolocation: CAPPlugin, CLLocationManagerDelegate, CAPBri
             return true
         }
         return false
+    }
+
+    /// Shyld (BL-092): whether the tracker runs, its last fix and its last error, for the app's
+    /// More › About and support. iOS has no foreground service: running is the location session.
+    @objc func diagnostics(_ call: CAPPluginCall) {
+        DispatchQueue.main.async {
+            let running = self.locationManager != nil
+            call.resolve([
+                "running": running,
+                "foreground": running,
+                "lastFixAt": self.lastFixAt.map { $0.timeIntervalSince1970 * 1000 } ?? NSNull(),
+                "lastError": self.lastError ?? NSNull(),
+                "lastErrorAt": self.lastErrorAt.map { $0.timeIntervalSince1970 * 1000 } ?? NSNull()
+            ])
+        }
+    }
+
+    /// The outbox had a 409 stop_tracking (main thread): stop now when no shift is left. The
+    /// 10-minute backstop stays for every other way a tracker runs with nothing tracked.
+    func stopForOutbox(tracking: Bool?) {
+        guard locationManager != nil, ShyldHandOff.stopsNow(tracking: tracking, startedAt: created, now: Date()) else { return }
+        untrackedSince = nil
+        lastError = "untracked: stopped, the server ended the shift's tracking"
+        lastErrorAt = Date()
+        stopForUntracked()
+    }
+
+    /// BL-092 backstop: the same as `stop`, with no call to answer (main thread).
+    private func stopForUntracked() {
+        stopUpdatingLocation()
+        locationManager?.delegate = nil
+        locationManager = nil
+        created = nil
+        locationBackendUrl = nil
+        locationHeaders = [:]
+        minIntervalMs = 0
+        lastPostedLocationTime = nil
+        if let callbackId = activeCallbackId {
+            bridge?.savedCall(withID: callbackId)?.keepAlive = false
+            activeCallbackId = nil
+        }
     }
 
     @objc func stop(_ call: CAPPluginCall) {
@@ -904,8 +959,12 @@ public class BackgroundGeolocation: CAPPlugin, CLLocationManagerDelegate, CAPBri
         _ manager: CLLocationManager,
         didFailWithError error: Error
     ) {
-        guard manager === locationManager,
-              let callbackId = activeCallbackId,
+        guard manager === locationManager else { return }
+        if (error as? CLError)?.code != .locationUnknown {
+            lastError = "location: \(error.localizedDescription)"
+            lastErrorAt = Date()
+        }
+        guard let callbackId = activeCallbackId,
               let call = self.bridge?.savedCall(withID: callbackId) else {
             return
         }
@@ -937,7 +996,21 @@ public class BackgroundGeolocation: CAPPlugin, CLLocationManagerDelegate, CAPBri
         }
 
         // Shyld: every accepted fix to Shyld's outbox (ShyldHandOff, FORK.md).
-        ShyldHandOff.deliver(location)
+        lastFixAt = Date()
+        let tracking = ShyldHandOff.deliver(location)
+        // BL-092 backstop: 10 minutes of fixes no shift wants, and the tracker stops itself.
+        if tracking == false {
+            if untrackedSince == nil { untrackedSince = Date() }
+        } else {
+            untrackedSince = nil
+        }
+        if ShyldHandOff.stopsUntracked(tracking: tracking, untrackedSince: untrackedSince, now: Date()) {
+            untrackedSince = nil
+            lastError = "untracked: stopped, no shift wanted its fixes for 10 minutes"
+            lastErrorAt = Date()
+            stopForUntracked()
+            return
+        }
 
         if locationLogEnabled {
             let skipAppend = locationLogSqliteEnabled && locationBackendUrl != nil

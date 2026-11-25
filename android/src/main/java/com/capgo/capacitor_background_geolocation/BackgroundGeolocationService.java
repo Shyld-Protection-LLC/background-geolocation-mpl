@@ -25,6 +25,7 @@ import android.os.PowerManager;
 import android.os.SystemClock;
 import androidx.core.app.NotificationCompat;
 import androidx.core.app.ServiceCompat;
+import androidx.core.content.ContextCompat;
 import androidx.core.location.LocationCompat;
 import androidx.core.location.LocationListenerCompat;
 import com.getcapacitor.Logger;
@@ -44,9 +45,11 @@ public class BackgroundGeolocationService extends Service {
     private static final double EARTH_RADIUS_M = 6371000;
 
     // Must be unique for this application.
-    private static final int NOTIFICATION_ID = 28351;
+    static final int NOTIFICATION_ID = 28351;
     static final String EXTRA_NOTIFICATION_TITLE = "notificationTitle";
     static final String EXTRA_NOTIFICATION_MESSAGE = "notificationMessage";
+    // Shyld (BL-092): the Doze-proof alarm's start, asking for a fresh fix.
+    static final String ACTION_FRESH_FIX = "com.shyld.tracker.FRESH_FIX";
 
     private String callbackId;
 
@@ -71,21 +74,58 @@ public class BackgroundGeolocationService extends Service {
 
     // Max acceptable accuracy radius (meters) for a NETWORK_PROVIDER fix; missing accuracy counts
     // as too imprecise too.
-    private static final float NETWORK_FIX_MAX_ACCURACY_M = 300f;
 
     // elapsedRealtime() of the last GPS_PROVIDER fix, or 0 if none yet. Monotonic, so it can't be
     // confused by wall-clock adjustments the way System.currentTimeMillis() could.
     private volatile long lastGpsFixAtMs = 0L;
 
-    // Opt-in flag for the NETWORK_PROVIDER fallback below; set via the "networkFallback" start
-    // option. Defaults to off, so GPS-only accuracy is unchanged unless a caller asks for it.
+    // Flag for the NETWORK_PROVIDER fallback below; set via the "networkFallback" start option.
+    // Shyld (BL-092): on unless the app turns it off (upstream's default is off).
     private volatile boolean networkFallbackEnabled = false;
+
+    // Shyld (BL-092): whether a fix has been taken since this start; the watchdog leaves a cold GPS
+    // searching until then (ShyldFixFilter.restartsAfterSilence).
+    private volatile boolean hadFixSinceStart = false;
+
+    // Shyld (BL-092): a fresh-fix ask after FRESH_FIX_AFTER_MS without a taken fix.
+    private Runnable freshFixRunnable;
+    private android.os.CancellationSignal freshFixCancel;
+    // elapsedRealtime of the last new reading (a repeat doesn't count), so the alarm and the
+    // Handler don't both ask, and a run of repeats doesn't put the ask off (VALP-1225).
+    private volatile long lastTakenAtMs = 0L;
+    // Shyld (BL-092, VALP-1225): the last taken fix, to tell a repeat from a new reading.
+    private boolean hasLastTaken = false;
+    // Shyld (BL-092, VALP-1233): whether a start is in effect. The service can stop itself while
+    // the plugin stays bound (stopForOutbox, stopIfUntracked), so being bound isn't running.
+    private volatile boolean active = false;
+    // Shyld (BL-092, VALP-1233): when the last start took effect (elapsedRealtime), for stopForOutbox.
+    private volatile long startedAtMs = 0L;
+    private double lastTakenLat;
+    private double lastTakenLng;
+    private float lastTakenAccuracyM;
+    // Play services' fused client where the phone has it, else null (LocationManager's providers).
+    private ShyldFusedClient fused;
+    private static final String PLAY_FUSED = "play-services-fused";
+    // BL-092 backstop: when the outbox was first seen tracking no shift (elapsedRealtime), or 0.
+    private long untrackedSinceMs = 0L;
+    // BL-092 (build 18's first fix): until when (elapsedRealtime) the fused stream runs fast, or 0.
+    private long fastUntilMs = 0L;
+    private final Runnable endFastRunnable = this::endFast;
+    // The providers this start listens to (BL-092), so one that comes back on is asked again.
+    private final java.util.Set<String> listening = new java.util.HashSet<>();
 
     // When set (via the "url" start option), each location is also POSTed to
     // this URL directly from native code so delivery survives the WebView being
     // destroyed. Delivery runs on postExecutor to keep it off the main thread.
     private String nativePostUrl;
     private ExecutorService postExecutor;
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        ShyldTracker.attach(this);
+        ShyldDiagnostics.watchIdle(this);
+    }
 
     @Override
     public IBinder onBind(Intent intent) {
@@ -106,7 +146,7 @@ public class BackgroundGeolocationService extends Service {
             return false;
         }
         if (client != null && locationCallback != null) {
-            client.removeUpdates(locationCallback);
+            removeAllUpdates();
         }
         releaseMediaPlayer();
         releaseWakeLock();
@@ -134,6 +174,21 @@ public class BackgroundGeolocationService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         Context context = getApplicationContext();
+        if (intent != null && ACTION_FRESH_FIX.equals(intent.getAction())) {
+            // Shyld (BL-092): the alarm woke us in Doze, where the Handler's timer doesn't run.
+            ShyldDiagnostics.alarmFired();
+            if (client != null && locationCallback != null) {
+                if (ShyldFixFilter.freshFixDue(SystemClock.elapsedRealtime(), lastTakenAtMs)) {
+                    askFreshFix();
+                } else {
+                    scheduleFreshFix();
+                }
+                return START_STICKY;
+            }
+            // Not tracking (a stale alarm after a stop): nothing to ask for.
+            stopSelfResult(startId);
+            return START_NOT_STICKY;
+        }
         if (!LocationStore.keepsRunning(context)) {
             // The plugin starts this service with startForegroundService(), and Android
             // kills the app unless startForeground() follows within a few seconds. Promote
@@ -147,6 +202,8 @@ public class BackgroundGeolocationService extends Service {
         }
         nativePostUrl = LocationStore.getUrl(context);
         promoteToForeground(LocationStore.getTitle(context), LocationStore.getMessage(context));
+        active = true;
+        startedAtMs = SystemClock.elapsedRealtime();
         if (client == null || locationCallback == null) {
             acquireWakeLock();
             client = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
@@ -156,17 +213,27 @@ public class BackgroundGeolocationService extends Service {
             locationLogEnabled = LocationStore.getLocationLog(context);
             locationLogMaxEntries = LocationStore.getLocationLogMaxEntries(context);
             locationCallback = createLocationListener(this);
-            lastGpsFixAtMs = SystemClock.elapsedRealtime();
+            // Shyld (BL-092): no GPS fix yet, so no grace (ShyldFixFilter.LAST_GPS_FIX_AT_START).
+            lastGpsFixAtMs = ShyldFixFilter.LAST_GPS_FIX_AT_START;
+            hadFixSinceStart = false;
+            hasLastTaken = false;
+            lastTakenAtMs = 0L;
             requestLocationUpdates();
             startWatchdog();
+            startFast();
         }
         return START_STICKY;
     }
 
     @Override
     public void onDestroy() {
+        active = false;
+        ShyldTracker.detach(this);
+        ShyldDiagnostics.unwatchIdle(this);
+        ShyldDiagnostics.running = false;
+        ShyldDiagnostics.foreground = false;
         if (client != null && locationCallback != null) {
-            client.removeUpdates(locationCallback);
+            removeAllUpdates();
         }
         super.onDestroy();
         releaseMediaPlayer();
@@ -226,11 +293,17 @@ public class BackgroundGeolocationService extends Service {
     }
 
     private void restartLocationUpdates() {
-        Logger.debug("Location watchdog timed out, restarting updates");
         if (client == null || locationCallback == null) {
             return;
         }
-        client.removeUpdates(locationCallback);
+        if (!ShyldFixFilter.restartsAfterSilence(hadFixSinceStart)) {
+            // Shyld (BL-092): no fix yet in this start. Restarting would throw away a cold GPS's
+            // search, so the providers keep listening and the watchdog looks again in a minute.
+            startWatchdog();
+            return;
+        }
+        Logger.debug("Location watchdog timed out, restarting updates");
+        removeAllUpdates();
         if (restartRunnable != null) {
             watchdogHandler.removeCallbacks(restartRunnable);
         }
@@ -245,14 +318,157 @@ public class BackgroundGeolocationService extends Service {
     }
 
     private void startWatchdog() {
-        stopWatchdog();
+        startWatchdog(true);
+    }
+
+    /**
+     * @param newReading false for a repeat of the last taken fix (VALP-1225): it still shows the
+     *     providers deliver, so the restart watchdog moves on, but the fresh-fix ask stays due.
+     */
+    private void startWatchdog(boolean newReading) {
+        // Shyld (BL-092): the timers only; a fresh-fix ask in flight is left to finish.
+        stopWatchdogTimers();
+        if (newReading) {
+            scheduleFreshFix();
+        }
         if (watchdogRunnable == null) {
             watchdogRunnable = this::restartLocationUpdates;
         }
         watchdogHandler.postDelayed(watchdogRunnable, 60000);
     }
 
+    /** Shyld (BL-092): ask for a fresh fix once no fix has been taken for FRESH_FIX_AFTER_MS. */
+    private void scheduleFreshFix() {
+        if (freshFixRunnable == null) {
+            freshFixRunnable = this::askFreshFix;
+        }
+        watchdogHandler.removeCallbacks(freshFixRunnable);
+        watchdogHandler.postDelayed(freshFixRunnable, ShyldFixFilter.FRESH_FIX_AFTER_MS);
+        armFreshFixAlarm();
+    }
+
+    /**
+     * Shyld (BL-092, build 13: a 7-minute gap right after the Pixel locked). The Handler's timer
+     * stops while the phone sleeps in Doze; an alarm set with setAndAllowWhileIdle still fires there
+     * (inexact, and at most about once every 9 minutes while idle), so a quiet, still phone is asked
+     * again. Each taken fix moves it on, so it fires only when fixes stop.
+     */
+    private void armFreshFixAlarm() {
+        try {
+            android.app.AlarmManager alarms = (android.app.AlarmManager) getSystemService(Context.ALARM_SERVICE);
+            if (alarms == null) return;
+            alarms.setAndAllowWhileIdle(
+                android.app.AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                SystemClock.elapsedRealtime() + ShyldFixFilter.FRESH_FIX_ALARM_MS,
+                freshFixIntent()
+            );
+        } catch (RuntimeException exception) {
+            ShyldDiagnostics.error("fresh", exception);
+        }
+    }
+
+    private void cancelFreshFixAlarm() {
+        try {
+            android.app.AlarmManager alarms = (android.app.AlarmManager) getSystemService(Context.ALARM_SERVICE);
+            if (alarms != null) alarms.cancel(freshFixIntent());
+        } catch (RuntimeException ignored) {
+            // Nothing armed.
+        }
+    }
+
+    private PendingIntent freshFixIntent() {
+        Intent intent = new Intent(this, BackgroundGeolocationService.class).setAction(ACTION_FRESH_FIX);
+        return PendingIntent.getService(this, 0x5f1e, intent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+    }
+
+    /**
+     * Still and locked, the providers can go quiet for minutes (the Pixel on build 12). A current-
+     * location ask computes a new fix (a fresh Wi-Fi or cell reading), which the filter then judges
+     * like any other; the outbox's heartbeat needs one each minute. Asked again until fixes return.
+     */
+    private void askFreshFix() {
+        if (client == null || locationCallback == null) {
+            return;
+        }
+        listenToFallbacks();
+        if (fused != null) {
+            // Shyld (BL-092, VALP-1225): a newly computed fix, balanced each minute and at high
+            // accuracy once the same reading has stood for 5 minutes (ShyldFixFilter).
+            int priority = ShyldFixFilter.freshFixPriority(SystemClock.elapsedRealtime(), lastTakenAtMs);
+            ShyldDiagnostics.asked("fresh");
+            try {
+                fused.askCurrent(priority, ShyldFixFilter.freshFixDurationMs(priority), (fix) -> {
+                    ShyldDiagnostics.answered("fresh");
+                    if (client != null && locationCallback != null) {
+                        handleLocationChanged(fix);
+                    }
+                });
+            } catch (SecurityException | IllegalArgumentException | IllegalStateException exception) {
+                ShyldDiagnostics.error("fresh", exception);
+            }
+            scheduleFreshFix();
+            return;
+        }
+        String provider = ShyldFixFilter.freshFixProvider(
+            Build.VERSION.SDK_INT,
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && providerOn(LocationManager.FUSED_PROVIDER),
+            providerOn(LocationManager.NETWORK_PROVIDER),
+            providerOn(LocationManager.GPS_PROVIDER)
+        );
+        if (provider != null) {
+            ShyldDiagnostics.asked("fresh");
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    if (freshFixCancel != null) {
+                        freshFixCancel.cancel();
+                    }
+                    freshFixCancel = new android.os.CancellationSignal();
+                    client.getCurrentLocation(provider, freshFixCancel, ContextCompat.getMainExecutor(this), (fix) -> {
+                        if (fix != null) ShyldDiagnostics.answered("fresh");
+                        if (fix != null && client != null && locationCallback != null) {
+                            handleLocationChanged(fix);
+                        }
+                    });
+                } else {
+                    client.requestSingleUpdate(provider, locationCallback, Looper.getMainLooper());
+                }
+            } catch (SecurityException | IllegalArgumentException exception) {
+                ShyldDiagnostics.error("fresh", exception);
+            }
+        }
+        scheduleFreshFix();
+    }
+
+    /** Precise location allowed (fine); approximate only gets no fallback cap (ShyldFixFilter.fallbackCap). */
+    private boolean preciseGranted() {
+        return ContextCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_FINE_LOCATION)
+            == android.content.pm.PackageManager.PERMISSION_GRANTED;
+    }
+
+    private boolean providerOn(String provider) {
+        try {
+            return client != null && client.isProviderEnabled(provider);
+        } catch (RuntimeException exception) {
+            return false;
+        }
+    }
+
     private void stopWatchdog() {
+        stopWatchdogTimers();
+        cancelFreshFixAlarm();
+        if (freshFixRunnable != null) {
+            watchdogHandler.removeCallbacks(freshFixRunnable);
+        }
+        if (freshFixCancel != null) {
+            freshFixCancel.cancel();
+            freshFixCancel = null;
+        }
+        if (fused != null) {
+            fused.cancelAsk();
+        }
+    }
+
+    private void stopWatchdogTimers() {
         if (watchdogRunnable != null) {
             watchdogHandler.removeCallbacks(watchdogRunnable);
         }
@@ -264,18 +480,47 @@ public class BackgroundGeolocationService extends Service {
     private void handleLocationChanged(android.location.Location location) {
         if (LocationManager.GPS_PROVIDER.equals(location.getProvider())) {
             lastGpsFixAtMs = SystemClock.elapsedRealtime();
-        } else if (LocationManager.NETWORK_PROVIDER.equals(location.getProvider())) {
-            boolean gpsStillFresh = lastGpsFixAtMs != 0 && SystemClock.elapsedRealtime() - lastGpsFixAtMs < NETWORK_FALLBACK_GRACE_MS;
-            boolean tooImprecise = !location.hasAccuracy() || location.getAccuracy() > NETWORK_FIX_MAX_ACCURACY_M;
-            if (gpsStillFresh || tooImprecise) {
+        } else {
+            // Shyld (BL-092): network and fused fixes on the same terms (ShyldFixFilter).
+            String rejection = ShyldFixFilter.rejection(
+                location.getProvider(),
+                SystemClock.elapsedRealtime(),
+                lastGpsFixAtMs,
+                NETWORK_FALLBACK_GRACE_MS,
+                location.hasAccuracy() ? location.getAccuracy() : -1f,
+                ShyldFixFilter.fallbackCap(preciseGranted())
+            );
+            if (rejection != null) {
+                ShyldDiagnostics.rejected(rejection);
                 // Drop it - and skip startWatchdog() below so a run of rejected fixes can't mask a
                 // genuinely stalled GPS_PROVIDER and suppress the restart that would recover it.
                 return;
             }
         }
-        startWatchdog();
+        ShyldDiagnostics.fixFrom(location.getProvider());
+        hadFixSinceStart = true;
+        float accuracyM = location.hasAccuracy() ? location.getAccuracy() : -1f;
+        boolean repeat = ShyldFixFilter.isRepeat(
+            hasLastTaken,
+            location.getLatitude(),
+            location.getLongitude(),
+            accuracyM,
+            lastTakenLat,
+            lastTakenLng,
+            lastTakenAccuracyM
+        );
+        hasLastTaken = true;
+        lastTakenLat = location.getLatitude();
+        lastTakenLng = location.getLongitude();
+        lastTakenAccuracyM = accuracyM;
+        if (!repeat) {
+            lastTakenAtMs = SystemClock.elapsedRealtime();
+        }
+        startWatchdog(!repeat);
+        ShyldDiagnostics.lastFixAtMs = System.currentTimeMillis();
         // Shyld: every accepted fix to Shyld's outbox (ShyldHandOff, FORK.md).
         ShyldHandOff.deliver(getApplicationContext(), location);
+        if (stopIfUntracked()) return;
         if (locationLogEnabled) {
             boolean locationLogSqlite = LocationStore.getLocationLogSqlite(getApplicationContext());
             if (!locationLogSqlite || nativePostUrl == null) {
@@ -294,6 +539,80 @@ public class BackgroundGeolocationService extends Service {
             isOffRoute = offRoute;
         }
         LocalEvents.emitLocation(callbackId, location);
+    }
+
+    /**
+     * Shyld (BL-092 backstop): after 10 minutes of fixes the outbox wants for no shift, the tracker
+     * stops itself (ShyldFixFilter.stopsUntracked). The app starts it again for the next shift.
+     */
+    private boolean stopIfUntracked() {
+        Boolean tracking = ShyldHandOff.outboxTracking(getApplicationContext());
+        long now = SystemClock.elapsedRealtime();
+        if (!Boolean.FALSE.equals(tracking)) {
+            untrackedSinceMs = 0L;
+            return false;
+        }
+        if (untrackedSinceMs == 0L) untrackedSinceMs = now;
+        if (!ShyldFixFilter.stopsUntracked(tracking, untrackedSinceMs, now)) return false;
+        untrackedSinceMs = 0L;
+        ShyldDiagnostics.error("untracked", "stopped: no shift wanted its fixes for 10 minutes");
+        ((LocalBinder) binder).stop();
+        return true;
+    }
+
+    /**
+     * Shyld (BL-092, C 11-24): the outbox had a 409 stop_tracking (ShyldTracker, main thread).
+     * The tracker stops at once when no shift is tracked any more; the 10-minute backstop above
+     * stays for every other way a tracker ends up running with nothing tracked.
+     */
+    void stopForOutbox() {
+        if (client == null || locationCallback == null) return;
+        if (!ShyldFixFilter.stopsNow(ShyldHandOff.outboxTracking(getApplicationContext()), startedAtMs, SystemClock.elapsedRealtime())) return;
+        untrackedSinceMs = 0L;
+        ShyldDiagnostics.error("untracked", "stopped: the server ended the shift's tracking");
+        ((LocalBinder) binder).stop();
+    }
+
+    /**
+     * Shyld (BL-092, build 18: indoors, the Pixel's first row came 3 minutes after clock-in). At a
+     * start, and when the outbox begins tracking a shift (ShyldTracker.outboxStarted), ask for a
+     * newly computed fix at once and run the fused stream fast for a minute (ShyldFixFilter).
+     * Without Play services, LocationManager's current-location ask (askFreshFix) goes at once.
+     */
+    void startFast() {
+        if (client == null || locationCallback == null) return;
+        fastUntilMs = SystemClock.elapsedRealtime() + ShyldFixFilter.FAST_START_MS;
+        watchdogHandler.removeCallbacks(endFastRunnable);
+        watchdogHandler.postDelayed(endFastRunnable, ShyldFixFilter.FAST_START_MS);
+        if (fused == null) {
+            askFreshFix();
+            return;
+        }
+        try {
+            ShyldDiagnostics.asked("first");
+            fused.askFirst((fix) -> {
+                ShyldDiagnostics.answered("first");
+                if (client != null && locationCallback != null) {
+                    handleLocationChanged(fix);
+                }
+            });
+            if (listening.contains(PLAY_FUSED)) {
+                fused.startUpdates(currentDistanceFilter, this::handleLocationChanged, true);
+            }
+        } catch (SecurityException | IllegalArgumentException | IllegalStateException exception) {
+            ShyldDiagnostics.error("first", exception);
+        }
+    }
+
+    /** The minute is over: the fused stream goes back to every 50 s. */
+    private void endFast() {
+        fastUntilMs = 0L;
+        if (fused == null || client == null || locationCallback == null || !listening.contains(PLAY_FUSED)) return;
+        try {
+            fused.startUpdates(currentDistanceFilter, this::handleLocationChanged, false);
+        } catch (SecurityException | IllegalArgumentException | IllegalStateException exception) {
+            ShyldDiagnostics.error("fused", exception);
+        }
     }
 
     // Delivers a location to the configured URL from native code, so it works
@@ -360,16 +679,34 @@ public class BackgroundGeolocationService extends Service {
     }
 
     private long locationIntervalMs() {
-        return currentMinIntervalMs > 0 ? currentMinIntervalMs : 1000L;
+        // Shyld (BL-092): never oftener than every 5 s (ShyldFixFilter.providerIntervalMs).
+        return ShyldFixFilter.providerIntervalMs(currentMinIntervalMs);
+    }
+
+    /** Shyld (BL-092): LocationManager's listener and Play services' stream, both off. */
+    private void removeAllUpdates() {
+        if (client != null && locationCallback != null) {
+            client.removeUpdates(locationCallback);
+        }
+        if (fused != null) {
+            fused.stop();
+        }
+        listening.clear();
     }
 
     private void requestLocationUpdates() {
+        listening.clear();
+        if (fused == null) {
+            fused = ShyldFusedClient.createIfAvailable(getApplicationContext());
+        }
         try {
             client.requestLocationUpdates(LocationManager.GPS_PROVIDER, locationIntervalMs(), currentDistanceFilter, locationCallback);
-        } catch (SecurityException ignore) {
-            // According to Android Studio, this method can throw a Security Exception if
-            // permissions are not yet granted. Rather than check the permissions, which is fiddly,
-            // we simply ignore the exception.
+            listening.add(LocationManager.GPS_PROVIDER);
+            ShyldDiagnostics.resolved("gps");
+        } catch (SecurityException | IllegalArgumentException exception) {
+            // Shyld (BL-092): refused with approximate location only, or no GPS provider. Said in the
+            // log rather than ignored; the network fallback below still gives fixes.
+            ShyldDiagnostics.error("gps", exception);
         }
         if (!networkFallbackEnabled) {
             return;
@@ -379,17 +716,58 @@ public class BackgroundGeolocationService extends Service {
         // fires first reaches handleLocationChanged(). No manifest change needed -
         // ACCESS_COARSE_LOCATION is already declared. isProviderEnabled guards against devices
         // with network location turned off.
+        listenToFallbacks();
+    }
+
+    /**
+     * Shyld (BL-092): the network provider (on a Pixel, off while Google Location Accuracy is off)
+     * and, on API 31+, the fused one, which places a phone indoors from Wi-Fi as iOS does. Asked
+     * again at each fresh-fix ask for any that was off: the owner's Pixel started tracking as the
+     * one-tap turned Location on, found fused off, and never listened to it after.
+     */
+    private void listenToFallbacks() {
+        if (client == null || locationCallback == null || !networkFallbackEnabled) {
+            return;
+        }
+        listenIfOn(LocationManager.NETWORK_PROVIDER, "network");
+        if (ShyldFixFilter.asksFused(Build.VERSION.SDK_INT, networkFallbackEnabled, fused != null)) {
+            listenIfOn(LocationManager.FUSED_PROVIDER, "fused");
+        }
+        listenToPlayServices();
+    }
+
+    /**
+     * Shyld (BL-092, VALP-1225): with Play services, its fused stream at high accuracy in place of
+     * LocationManager's fused provider, whose legacy request ran at the platform's default quality.
+     */
+    private void listenToPlayServices() {
+        if (fused == null || listening.contains(PLAY_FUSED)) {
+            return;
+        }
         try {
-            if (client.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
-                client.requestLocationUpdates(
-                    LocationManager.NETWORK_PROVIDER,
-                    locationIntervalMs(),
-                    currentDistanceFilter,
-                    locationCallback
-                );
+            fused.startUpdates(currentDistanceFilter, this::handleLocationChanged,
+                ShyldFixFilter.fastStream(SystemClock.elapsedRealtime(), fastUntilMs));
+            listening.add(PLAY_FUSED);
+            ShyldDiagnostics.resolved("fused");
+        } catch (SecurityException | IllegalArgumentException | IllegalStateException exception) {
+            ShyldDiagnostics.error("fused", exception);
+        }
+    }
+
+    private void listenIfOn(String provider, String name) {
+        if (listening.contains(provider)) {
+            return;
+        }
+        try {
+            if (client.isProviderEnabled(provider)) {
+                client.requestLocationUpdates(provider, locationIntervalMs(), currentDistanceFilter, locationCallback);
+                listening.add(provider);
+                ShyldDiagnostics.resolved(name);
+            } else {
+                ShyldDiagnostics.error(name, "provider off");
             }
-        } catch (SecurityException ignore) {
-            // Same rationale as the GPS_PROVIDER catch above.
+        } catch (SecurityException | IllegalArgumentException exception) {
+            ShyldDiagnostics.error(name, exception);
         }
     }
 
@@ -413,8 +791,14 @@ public class BackgroundGeolocationService extends Service {
             } else {
                 startForeground(NOTIFICATION_ID, createBackgroundNotification(notificationTitle, notificationMessage));
             }
+            ShyldDiagnostics.running = true;
+            ShyldDiagnostics.foreground = true;
         } catch (Exception exception) {
             Logger.error("Failed to foreground service", exception);
+            // Shyld (BL-092): kept for diagnostics() rather than only logged.
+            ShyldDiagnostics.running = true;
+            ShyldDiagnostics.foreground = false;
+            ShyldDiagnostics.error("foreground", exception);
         }
     }
 
@@ -439,10 +823,16 @@ public class BackgroundGeolocationService extends Service {
             // a GPS chip), the plugin stops the service again, and Android kills the app
             // unless startForeground() already ran. So promote first.
             promoteToForeground(notificationTitle, notificationMessage);
+            active = true;
+            startedAtMs = SystemClock.elapsedRealtime();
             releaseMediaPlayer();
             acquireWakeLock();
             client = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
-            lastGpsFixAtMs = SystemClock.elapsedRealtime();
+            // Shyld (BL-092): no GPS fix yet, so no grace (ShyldFixFilter.LAST_GPS_FIX_AT_START).
+            lastGpsFixAtMs = ShyldFixFilter.LAST_GPS_FIX_AT_START;
+            hadFixSinceStart = false;
+            hasLastTaken = false;
+            lastTakenAtMs = 0L;
             callbackId = id;
             currentDistanceFilter = distanceFilter;
             currentMinIntervalMs = Math.max(0L, minIntervalMs);
@@ -472,20 +862,32 @@ public class BackgroundGeolocationService extends Service {
             // The service may already be running (for example after a sticky
             // restart), so drop any previous listener before registering a new one.
             if (locationCallback != null) {
-                client.removeUpdates(locationCallback);
+                removeAllUpdates();
             }
             locationCallback = createLocationListener(BackgroundGeolocationService.this);
             requestLocationUpdates();
             // Arm the watchdog here so rejected network fixes during the grace period cannot
             // leave tracking without a restart path if GPS_PROVIDER goes silent.
             startWatchdog();
+            // Shyld (BL-092, build 18): a first fix now, not after the stream's first minute.
+            startFast();
         }
 
         void updateHeaders(final Map<String, String> headers) {
             LocationStore.saveHeaders(getApplicationContext(), headers);
         }
 
+        /** Shyld (BL-092, VALP-1233): whether a start is in effect, not only bound. */
+        boolean isActive() {
+            return active;
+        }
+
         String stop() {
+            active = false;
+            ShyldDiagnostics.running = false;
+            ShyldDiagnostics.foreground = false;
+            fastUntilMs = 0L;
+            watchdogHandler.removeCallbacks(endFastRunnable);
             LocationStore.clear(getApplicationContext());
             nativePostUrl = null;
             stopWatchdog();
@@ -493,7 +895,7 @@ public class BackgroundGeolocationService extends Service {
             // (JS calls start() then stop() back-to-back), in which case neither
             // field is set. Same guard as onUnbind() and onDestroy().
             if (client != null && locationCallback != null) {
-                client.removeUpdates(locationCallback);
+                removeAllUpdates();
             }
             ServiceCompat.stopForeground(BackgroundGeolocationService.this, ServiceCompat.STOP_FOREGROUND_REMOVE);
             stopSelf();
@@ -535,7 +937,28 @@ public class BackgroundGeolocationService extends Service {
         }
     }
 
+    /**
+     * Shyld (BL-092): the service makes its own channel. Upstream made it only in the plugin's load(),
+     * so a service started before that (a sticky restart, or a test) posted to a missing channel,
+     * which Android 8+ refuses for a foreground service. Creating an existing channel changes nothing.
+     */
+    static void ensureChannel(Context context) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
+        android.app.NotificationManager manager = context.getSystemService(android.app.NotificationManager.class);
+        if (manager == null || manager.getNotificationChannel(NOTIFICATION_CHANNEL_ID) != null) return;
+        android.app.NotificationChannel channel = new android.app.NotificationChannel(
+            NOTIFICATION_CHANNEL_ID,
+            getAppString("capacitor_background_geolocation_notification_channel_name", "Background Tracking", context),
+            android.app.NotificationManager.IMPORTANCE_DEFAULT
+        );
+        channel.enableLights(false);
+        channel.enableVibration(false);
+        channel.setSound(null, null);
+        manager.createNotificationChannel(channel);
+    }
+
     private Notification createBackgroundNotification(String backgroundTitle, String backgroundMessage) {
+        ensureChannel(getApplicationContext());
         NotificationCompat.Builder builder = new NotificationCompat.Builder(getApplicationContext(), NOTIFICATION_CHANNEL_ID)
             .setContentTitle(backgroundTitle)
             .setContentText(backgroundMessage)
@@ -549,9 +972,10 @@ public class BackgroundGeolocationService extends Service {
             // It is actually necessary to set a valid icon for the notification to behave
             // correctly when tapped. If there is no icon specified, tapping it will open the
             // app's settings, rather than bringing the application to the foreground.
-            builder.setSmallIcon(getAppResourceIdentifier(parts[1], parts[0], getApplicationContext()));
+            builder.setSmallIcon(smallIcon(getAppResourceIdentifier(parts[1], parts[0], getApplicationContext())));
         } catch (Exception e) {
             Logger.error("Could not set notification icon", e);
+            builder.setSmallIcon(smallIcon(0));
         }
 
         try {
@@ -585,6 +1009,15 @@ public class BackgroundGeolocationService extends Service {
     // The name comes from the host app's configuration, so it can only be resolved by
     // reflection; the compile-time R class of this library does not contain it.
     @SuppressLint("DiscouragedApi")
+    /**
+     * Shyld (BL-092): the app's icon, or Android's own location icon when the app has none. Without
+     * a small icon Android refuses startForeground, the service never reaches the foreground and the
+     * process is killed for it (the native gate's start-path case, in a test APK with no launcher icon).
+     */
+    static int smallIcon(int appIcon) {
+        return appIcon != 0 ? appIcon : android.R.drawable.ic_menu_mylocation;
+    }
+
     private static int getAppResourceIdentifier(String name, String defType, Context context) {
         return context.getResources().getIdentifier(name, defType, context.getPackageName());
     }

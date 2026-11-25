@@ -204,11 +204,12 @@ export interface StartOptions {
    * silent for 20+ seconds, and is dropped if its reported accuracy is worse
    * than 300m or unreported.
    *
-   * Defaults to `false`, so existing GPS-only accuracy characteristics are
-   * unchanged unless you opt in.
+   * Shyld (BL-092): defaults to `true` in this fork (upstream: `false`). With GPS
+   * alone, a phone indoors, or one allowed approximate location only, gets no
+   * fix at all.
    *
    * @since 8.5.0
-   * @default false
+   * @default true
    * @example
    * // Fill gaps in GPS coverage with a coarser network-based location
    * networkFallback: true
@@ -838,6 +839,20 @@ export interface BackgroundGeolocationPlugin {
    * );
    */
   start(options: StartOptions, callback: (position?: Location, error?: CallbackError) => void): Promise<void>;
+
+  /**
+   * Shyld (BL-092): what the tracker is doing, for the app's About screen and support. `running`:
+   * the location session (Android: the service) is up; `foreground`: Android's service reached the
+   * foreground (iOS: same as running); `lastFixAt` and `lastErrorAt` in ms since the epoch;
+   * `lastError`: the last refusal or failure, which `start()` reports only to its callback.
+   */
+  diagnostics(): Promise<{
+    running: boolean;
+    foreground: boolean;
+    lastFixAt: number | null;
+    lastError: string | null;
+    lastErrorAt: number | null;
+  }>;
 
   /**
    * Stops location updates.

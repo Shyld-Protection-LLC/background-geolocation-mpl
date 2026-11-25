@@ -51,6 +51,23 @@ final class ShyldHandOff {
         }
     }
 
+    /**
+     * Whether Shyld's outbox tracks a shift (BL-092 backstop): null without the outbox, or when it
+     * can't say (an older outbox), which never stops anything.
+     */
+    static Boolean outboxTracking(Context context) {
+        try {
+            Object tracking = Class.forName(OUTBOX).getMethod("tracksAShift", Context.class)
+                    .invoke(null, context.getApplicationContext());
+            return tracking instanceof Boolean ? (Boolean) tracking : null;
+        } catch (ClassNotFoundException | NoSuchMethodException e) {
+            return null;
+        } catch (Exception e) {
+            Logger.error("Shyld outbox tracking check failed", e);
+            return null;
+        }
+    }
+
     /** The app was swiped away: Shyld's alerts say "Tracking stopped" if a shift is on. */
     static void appClosed(Context context) {
         try {

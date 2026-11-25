@@ -85,5 +85,7 @@ dependencies {
     testImplementation "androidx.work:work-testing:$androidxWorkRuntimeVersion"
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
+    androidTestImplementation "androidx.test:core:1.7.0"
+    androidTestImplementation "androidx.test:runner:1.7.0"
     implementation "com.google.android.gms:play-services-location:$playServicesLocationVersion"
 }

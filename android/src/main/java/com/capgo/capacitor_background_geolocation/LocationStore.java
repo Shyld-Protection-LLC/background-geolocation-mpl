@@ -133,7 +133,8 @@ final class LocationStore {
     }
 
     static boolean getNetworkFallback(Context context) {
-        return prefs(context).getBoolean(KEY_NETWORK_FALLBACK, false);
+        // Shyld (BL-092): on unless the app turned it off, as at start().
+        return prefs(context).getBoolean(KEY_NETWORK_FALLBACK, true);
     }
 
     static boolean getLocationLog(Context context) {

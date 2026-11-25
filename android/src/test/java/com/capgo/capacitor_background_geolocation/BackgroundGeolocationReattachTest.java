@@ -4,6 +4,7 @@
 package com.capgo.capacitor_background_geolocation;
 
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
@@ -19,6 +20,7 @@ import java.lang.reflect.Field;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.Test;
+import org.robolectric.Robolectric;
 import org.junit.runner.RunWith;
 import org.robolectric.RobolectricTestRunner;
 import org.robolectric.annotation.Config;
@@ -65,6 +67,59 @@ public class BackgroundGeolocationReattachTest {
         assertSame(call, get(plugin, "watchCall"));
         assertTrue(call.isKeptAlive());
         assertNull(rejected.get());
+    }
+
+    /*
+     * BL-092, VALP-1233 (build 19, the owner's Pixel): the service stopped itself on a 409 while the
+     * plugin stayed bound, and every later start() only re-attached: no notification, no tracking.
+     */
+    @Test
+    public void aConnectionWhoseServiceStoppedItselfIsStale() {
+        CompletableFuture<BackgroundGeolocationService.LocalBinder> connection = CompletableFuture.completedFuture(binderOf(service()));
+        assertFalse("stopped, only bound: start afresh", BackgroundGeolocation.reattaches(connection, CompletableFuture.completedFuture(null)));
+        assertFalse(BackgroundGeolocation.reattaches(connection, null));
+    }
+
+    @Test
+    public void aRunningOrInFlightStartReattaches() throws Exception {
+        BackgroundGeolocationService service = service();
+        BackgroundGeolocationService.LocalBinder binder = binderOf(service);
+        CompletableFuture<BackgroundGeolocationService.LocalBinder> connection = CompletableFuture.completedFuture(binder);
+        assertTrue("connecting", BackgroundGeolocation.reattaches(new CompletableFuture<>(), null));
+        assertTrue("connected, the service's start not run yet", BackgroundGeolocation.reattaches(connection, new CompletableFuture<>()));
+        Field active = BackgroundGeolocationService.class.getDeclaredField("active");
+        active.setAccessible(true);
+        active.set(service, true);
+        assertTrue("running", BackgroundGeolocation.reattaches(connection, CompletableFuture.completedFuture(null)));
+        binder.stop();
+        assertFalse("stopped by itself", BackgroundGeolocation.reattaches(connection, CompletableFuture.completedFuture(null)));
+        assertFalse("no connection", BackgroundGeolocation.reattaches(null, null));
+    }
+
+    @Test
+    public void startAfterTheServiceStoppedItselfIsAFreshStart() throws Exception {
+        Plugin plugin = new Plugin(ApplicationProvider.getApplicationContext());
+        AtomicReference<String> oldRejected = new AtomicReference<>();
+        AtomicReference<String> rejected = new AtomicReference<>();
+        PluginCall oldCall = startCall("old-page", oldRejected);
+        PluginCall call = startCall("page", rejected);
+        CompletableFuture<BackgroundGeolocationService.LocalBinder> stale = CompletableFuture.completedFuture(binderOf(service()));
+        set(plugin, "watchCall", oldCall);
+        set(plugin, "serviceConnectionFuture", stale);
+        set(plugin, "serviceStartedFuture", CompletableFuture.completedFuture(null));
+
+        plugin.start(call);
+
+        assertNotSame("the stale connection is dropped", stale, get(plugin, "serviceConnectionFuture"));
+        assertSame(call, get(plugin, "watchCall"));
+    }
+
+    private static BackgroundGeolocationService service() {
+        return Robolectric.buildService(BackgroundGeolocationService.class).create().get();
+    }
+
+    private static BackgroundGeolocationService.LocalBinder binderOf(BackgroundGeolocationService service) {
+        return (BackgroundGeolocationService.LocalBinder) service.onBind(null);
     }
 
     private static PluginCall startCall(String id, AtomicReference<String> rejected) {

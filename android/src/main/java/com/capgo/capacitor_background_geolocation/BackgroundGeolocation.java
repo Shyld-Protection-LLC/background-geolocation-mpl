@@ -89,18 +89,30 @@ public class BackgroundGeolocation extends Plugin {
     @PluginMethod(returnType = PluginMethod.RETURN_CALLBACK)
     public void start(final PluginCall call) {
         if (getPermissionState("location") != PermissionState.GRANTED && !call.getBoolean("requestPermissions", true)) {
+            ShyldDiagnostics.error("start", "NOT_AUTHORIZED location permission not granted");
             call.reject("User denied location permission", "NOT_AUTHORIZED");
             return;
         }
 
         if (serviceConnectionFuture != null) {
-            // Shyld (BL-088): a page reloaded while tracking runs (a live update, "Restart now")
-            // re-attaches its callback rather than being refused, so its screen gets fixes again.
-            reattach(call);
-            return;
+            if (reattaches(serviceConnectionFuture, serviceStartedFuture)) {
+                // Shyld (BL-088): a page reloaded while tracking runs (a live update, "Restart now")
+                // re-attaches its callback rather than being refused, so its screen gets fixes again.
+                reattach(call);
+                return;
+            }
+            // Shyld (BL-092, VALP-1233): the service stopped itself (the server's 409, or nothing
+            // tracked) while still bound. Re-attaching would only hand back the last fix, with no
+            // tracking and no notification, so the stale connection goes and this start is fresh.
+            ShyldDiagnostics.error("start", "restarted: the tracker had stopped itself while bound");
+            releaseServiceConnection();
+            stopBackgroundService();
+            serviceConnectionFuture = null;
+            serviceStartedFuture = null;
         }
 
         if (orphanNativeDeliveryStopFuture != null && !orphanNativeDeliveryStopFuture.isDone()) {
+            ShyldDiagnostics.error("start", "ALREADY_STARTED a stop is still in flight");
             call.reject("Service already started", "ALREADY_STARTED");
             return;
         }
@@ -133,6 +145,7 @@ public class BackgroundGeolocation extends Plugin {
 
         // location permission granted.
         if (!isLocationEnabled(getContext())) {
+            ShyldDiagnostics.error("start", "NOT_AUTHORIZED location services off");
             call.reject("Location services disabled.", "NOT_AUTHORIZED");
             return;
         }
@@ -141,6 +154,33 @@ public class BackgroundGeolocation extends Plugin {
         call.setKeepAlive(true);
         watchCall = call;
         proceedWithStart(call);
+    }
+
+    /**
+     * Shyld (BL-092): the network fallback is on unless the app turns it off. With GPS alone, a phone
+     * indoors (or one allowed approximate location only, where GPS_PROVIDER is refused) gets no fix
+     * at all; iOS blends Wi-Fi and cell positions in by itself. Network fixes are still taken only
+     * when GPS has been quiet for its grace period and they're within 300 m.
+     */
+    static boolean networkFallbackOption(PluginCall call) {
+        return call.getBoolean("networkFallback", true);
+    }
+
+    /**
+     * Shyld (BL-092, VALP-1233): a start() re-attaches while the service connection is still being
+     * made or the service's start hasn't run yet (a start in flight), or the service's start is in
+     * effect; a connection whose service stopped itself is stale, and the start goes ahead afresh.
+     */
+    static boolean reattaches(
+        CompletableFuture<BackgroundGeolocationService.LocalBinder> connection,
+        CompletableFuture<Void> started
+    ) {
+        if (connection == null) return false;
+        if (!connection.isDone()) return true;
+        if (started != null && !started.isDone()) return true;
+        if (connection.isCompletedExceptionally()) return false;
+        BackgroundGeolocationService.LocalBinder binder = connection.getNow(null);
+        return binder == null || binder.isActive();
     }
 
     /**
@@ -185,7 +225,7 @@ public class BackgroundGeolocation extends Plugin {
                 call.getString("url", null),
                 headersFromCall(call),
                 longOptionFromCall(call, "minIntervalMs", 0L),
-                call.getBoolean("networkFallback", false),
+                networkFallbackOption(call),
                 call.getBoolean("locationLog", false),
                 Math.max(1, call.getInt("locationLogMaxEntries", LocationLog.DEFAULT_MAX_ENTRIES)),
                 call.getBoolean("locationLogSqlite", false)
@@ -200,6 +240,12 @@ public class BackgroundGeolocation extends Plugin {
             rejectServiceStartFailure(call, throwable);
             return null;
         });
+    }
+
+    /** Shyld (BL-092): whether the tracker runs in the foreground, its last fix and its last error. */
+    @PluginMethod
+    public void diagnostics(PluginCall call) {
+        call.resolve(ShyldDiagnostics.snapshot(getContext()));
     }
 
     /** Drops geofence transitions queued for a native POST, for sign-out or an account switch. */
@@ -1124,6 +1170,7 @@ public class BackgroundGeolocation extends Plugin {
 
     private void rejectServiceStartFailure(PluginCall call, Throwable throwable) {
         Throwable cause = unwrapThrowable(throwable);
+        ShyldDiagnostics.error("start", cause);
         if (isForegroundServiceStartNotAllowed(cause)) {
             call.reject(
                 "Cannot start background location while the app is in the background. Bring the app to the foreground and call start() again.",

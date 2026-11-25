@@ -117,6 +117,12 @@ export class BackgroundGeolocationWeb extends WebPlugin implements BackgroundGeo
     }
   }
 
+  /** Shyld (BL-092): the browser's watch; no foreground service, fix times or errors are kept. */
+  async diagnostics() {
+    const running = this.watchId !== undefined;
+    return { running, foreground: running, lastFixAt: null, lastError: null, lastErrorAt: null };
+  }
+
   async openSettings(): Promise<void> {
     console.log("openSettings: Web implementation cannot open native settings");
     window.alert("Please enable location permissions in your browser settings");

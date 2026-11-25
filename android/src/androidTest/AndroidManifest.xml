@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Shyld (BL-092): the start-path test's host activity, so the service starts from the foreground. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <activity
+            android:name="com.capgo.capacitor_background_geolocation.StartPathHostActivity"
+            android:exported="false" />
+    </application>
+</manifest>

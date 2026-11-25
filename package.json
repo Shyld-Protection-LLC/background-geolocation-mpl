@@ -1,6 +1,6 @@
 {
   "name": "@shyld/plugin-background-geolocation",
-  "version": "8.6.5-shyld.1",
+  "version": "8.6.5-shyld.9",
   "private": true,
   "description": "Capgo's background-geolocation 8.6.5, forked under MPL-2.0 for the Shyld store app (decision 0139). FORK.md lists the changes.",
   "license": "MPL-2.0",
